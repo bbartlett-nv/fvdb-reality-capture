@@ -95,6 +95,80 @@ def ecef_to_geodetic(ecef: np.ndarray) -> tuple[float, float, float]:
     return lat, lon, alt
 
 
+# ═══════════════════ Batch Geodetic ↔ ECEF ════════════════════════════════ #
+
+
+def batch_geodetic_to_ecef(
+    lat_deg: np.ndarray,
+    lon_deg: np.ndarray,
+    alt_m: np.ndarray,
+) -> np.ndarray:
+    """
+    Vectorized geodetic → ECEF for N points.
+
+    Parameters
+    ----------
+    lat_deg, lon_deg, alt_m : (N,) arrays
+
+    Returns
+    -------
+    (N, 3) ECEF array
+    """
+    lat = np.radians(lat_deg)
+    lon = np.radians(lon_deg)
+    sin_lat, cos_lat = np.sin(lat), np.cos(lat)
+    sin_lon, cos_lon = np.sin(lon), np.cos(lon)
+
+    N_prime = _WGS84_A / np.sqrt(1.0 - _WGS84_E2 * sin_lat ** 2)
+
+    X = (N_prime + alt_m) * cos_lat * cos_lon
+    Y = (N_prime + alt_m) * cos_lat * sin_lon
+    Z = (N_prime * (1.0 - _WGS84_E2) + alt_m) * sin_lat
+
+    return np.column_stack([X, Y, Z])
+
+
+def batch_ecef_to_geodetic(
+    ecef: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Vectorized ECEF → geodetic for N points using Bowring iteration.
+
+    Parameters
+    ----------
+    ecef : (N, 3)
+
+    Returns
+    -------
+    lat_deg, lon_deg, alt_m : each (N,)
+    """
+    X = ecef[:, 0]
+    Y = ecef[:, 1]
+    Z = ecef[:, 2]
+
+    lon = np.degrees(np.arctan2(Y, X))
+    p = np.sqrt(X ** 2 + Y ** 2)
+    lat = np.degrees(np.arctan2(Z, p * (1.0 - _WGS84_E2)))
+
+    for _ in range(10):
+        sin_lat = np.sin(np.radians(lat))
+        N_prime = _WGS84_A / np.sqrt(1.0 - _WGS84_E2 * sin_lat ** 2)
+        lat = np.degrees(np.arctan2(Z + _WGS84_E2 * N_prime * sin_lat, p))
+
+    sin_lat = np.sin(np.radians(lat))
+    cos_lat = np.cos(np.radians(lat))
+    N_prime = _WGS84_A / np.sqrt(1.0 - _WGS84_E2 * sin_lat ** 2)
+
+    # Altitude: use p/cos(lat) away from poles, Z/sin(lat) near poles
+    alt = np.where(
+        np.abs(cos_lat) > 1e-10,
+        p / cos_lat - N_prime,
+        np.abs(Z) / np.maximum(np.abs(sin_lat), 1e-30) - N_prime * (1 - _WGS84_E2),
+    )
+
+    return lat, lon, alt
+
+
 # ═══════════════════ ENU ↔ ECEF ═══════════════════════════════════════════ #
 
 def R_ecef_to_enu(lat_deg: float, lon_deg: float) -> np.ndarray:
@@ -258,6 +332,8 @@ def compute_world_to_camera(
     ltp: LTPReference,
     epoch_unix: float | None = None,
     C_sat_ecef_next: np.ndarray | None = None,
+    off_nadir_deg: float | None = None,
+    azimuth_deg: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Compute the COLMAP world-to-camera rotation ``R`` and translation ``t``
@@ -269,7 +345,7 @@ def compute_world_to_camera(
 
     To obtain the camera frame (OpenCV: +Z = optical axis toward ground),
     this function builds a **dynamic** body-to-camera rotation by projecting
-    the nadir and velocity vectors into the bus frame and constructing
+    the boresight and velocity vectors into the bus frame and constructing
     orthonormal camera axes from them.
 
     Parameters
@@ -284,6 +360,12 @@ def compute_world_to_camera(
     C_sat_ecef_next : (3,) or None
         Next frame's ECEF position for velocity estimation.  If ``None``
         an arbitrary perpendicular direction is used.
+    off_nadir_deg : float or None
+        Off-nadir angle in degrees.  If provided together with
+        ``azimuth_deg``, the boresight is tilted away from nadir by
+        this amount in the azimuth direction.
+    azimuth_deg : float or None
+        Satellite azimuth in degrees from north (clockwise).
 
     Returns
     -------
@@ -304,11 +386,41 @@ def compute_world_to_camera(
         R_e2b = R_q  # Assume already ECEF→Body
 
     # 3. Build a dynamic body-to-camera rotation.
-    #    The body frame has Z ≈ orbit normal (not nadir), so we project
-    #    the nadir and velocity vectors into body coordinates and construct
-    #    the OpenCV camera axes from them.
+    #    Start with nadir direction, then tilt if off-nadir metadata is available.
     nadir_ecef = -C_sat_ecef / np.linalg.norm(C_sat_ecef)
-    nadir_body = R_e2b @ nadir_ecef
+    boresight_ecef = nadir_ecef.copy()
+
+    # Apply off-nadir tilt using Rodrigues rotation
+    if (
+        off_nadir_deg is not None
+        and off_nadir_deg > 0
+        and azimuth_deg is not None
+    ):
+        # The metadata ``satellite_azimuth_mean`` is the ground-track
+        # azimuth (direction of travel).  The off-nadir tilt direction
+        # is approximately perpendicular to the track — empirically
+        # offset by −134° from the ground-track azimuth.
+        tilt_az = azimuth_deg - 134.0
+        az_rad = np.radians(tilt_az)
+        off_rad = np.radians(off_nadir_deg)
+
+        # Tilt direction in ENU: azimuth measured clockwise from north
+        tilt_enu = np.array([np.sin(az_rad), np.cos(az_rad), 0.0])
+
+        # Convert tilt direction to ECEF
+        R_l2e = ltp.R_e2l.T
+        tilt_ecef = R_l2e @ tilt_enu
+        tilt_ecef = tilt_ecef / np.linalg.norm(tilt_ecef)
+
+        # Rodrigues rotation: rotate nadir toward tilt direction by off_nadir
+        axis = np.cross(boresight_ecef, tilt_ecef)
+        axis = axis / np.linalg.norm(axis)
+        boresight_ecef = (
+            boresight_ecef * np.cos(off_rad)
+            + np.cross(axis, boresight_ecef) * np.sin(off_rad)
+        )
+
+    boresight_body = R_e2b @ boresight_ecef
 
     if C_sat_ecef_next is not None:
         vel_ecef = C_sat_ecef_next - C_sat_ecef
@@ -317,10 +429,11 @@ def compute_world_to_camera(
     vel_ecef = vel_ecef / np.linalg.norm(vel_ecef)
     vel_body = R_e2b @ vel_ecef
 
-    # Camera Z = nadir (optical axis toward ground)
-    cam_z = nadir_body / np.linalg.norm(nadir_body)
+    # Camera Z = boresight (optical axis toward ground, tilted if off-nadir)
+    cam_z = boresight_body / np.linalg.norm(boresight_body)
     # Camera X = cross-track (right in image)
-    cam_x = np.cross(cam_z, vel_body)
+    # Negate to match the sensor's pixel readout direction (column order).
+    cam_x = np.cross(vel_body, cam_z)
     cam_x = cam_x / np.linalg.norm(cam_x)
     # Camera Y = completes the right-handed frame (down in image)
     cam_y = np.cross(cam_z, cam_x)

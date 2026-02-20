@@ -50,8 +50,14 @@ from paths import (
     TARGET_RPC_TYPE,
 )
 from plot_errors import generate_all_diagnostics
-from ray_caster import DEMSampler, cast_rays_all_frames
-from rpc_check import RPCCheckResult, check_rpc_vs_pinhole
+from ray_caster import DEMSampler, cast_rays_all_frames, merge_multiview_tracks
+from rpc_check import (
+    RPCCheckResult,
+    check_rpc_vs_pinhole,
+    rpc_inverse,
+    verify_colmap_points_against_rpc,
+    verify_rpc_against_gdal,
+)
 
 # ──────────────────────────── Logging ──────────────────────────────────────── #
 
@@ -129,6 +135,14 @@ def parse_args() -> argparse.Namespace:
         help="Undistort raw L1A images to a pinhole camera model. "
         "Writes clean TIFFs to {output}/images/ and exports the "
         "COLMAP model with PINHOLE instead of OPENCV.",
+    )
+    p.add_argument(
+        "--scale-percentile",
+        type=float,
+        default=2.0,
+        help="Percentile for 16-to-8-bit scaling (default: 2.0 clips "
+        "the darkest/brightest 2%% of valid pixels).  Bounds are "
+        "averaged across all frames for consistent brightness.",
     )
     return p.parse_args()
 
@@ -215,6 +229,8 @@ def step_compute_poses(
                 ltp,
                 epoch_unix=pose.acquisition_epoch,
                 C_sat_ecef_next=next_ecef,
+                off_nadir_deg=pose.off_nadir_deg,
+                azimuth_deg=pose.satellite_heading,
             )
         rotations.append(R_wc)
         translations.append(t_wc)
@@ -280,12 +296,29 @@ def step_rpc_validation(
     rotations: list[np.ndarray],
     translations: list[np.ndarray],
     ltp: LTPReference,
+    points: np.ndarray | None = None,
+    observations: list[list[tuple[float, float, int]]] | None = None,
 ) -> list[RPCCheckResult | None]:
-    """Phase 4: Validate poses against RPC ground truth."""
+    """Phase 4: Validate poses against RPC ground truth.
+
+    If ``points`` and ``observations`` are provided, the actual ray-cast
+    3D points observed by each frame are used as test points instead of
+    a synthetic grid.
+    """
     logger.info("═══ Phase 4: RPC Validation ═══")
+    verify_rpc_against_gdal(poses)
     results: list[RPCCheckResult | None] = []
-    for pose, R, t in zip(poses, rotations, translations):
-        r = check_rpc_vs_pinhole(pose, R, t, ltp)
+    for i, (pose, R, t) in enumerate(zip(poses, rotations, translations)):
+        # Extract ENU points observed by this frame
+        test_pts = None
+        if points is not None and observations is not None and len(points) > 0:
+            frame_obs = observations[i]
+            if frame_obs:
+                # point3d_id is 1-based → index = id - 1
+                indices = [pt3d_id - 1 for _, _, pt3d_id in frame_obs if 0 < pt3d_id <= len(points)]
+                if indices:
+                    test_pts = points[np.array(indices), :3]
+        r = check_rpc_vs_pinhole(pose, R, t, ltp, test_points_enu=test_pts)
         results.append(r)
     return results
 
@@ -328,6 +361,10 @@ def step_diagnostics(
     points: np.ndarray | None,
     output_dir: Path,
     scale: float,
+    ltp: LTPReference | None = None,
+    dem_dir: Path | None = None,
+    raw_image_paths: list[str] | None = None,
+    observations: list[list[tuple[float, float, int]]] | None = None,
 ) -> None:
     """Phase 6: Generate diagnostic visualisations."""
     logger.info("═══ Phase 6: Generating Diagnostics ═══")
@@ -340,6 +377,128 @@ def step_diagnostics(
         output_dir,
         scale=scale,
     )
+
+    # 6.4 — Elevation maps (requires DEM and LTP)
+    if ltp is not None and dem_dir is not None:
+        from plot_errors import generate_elevation_maps
+
+        dem_files = sorted(dem_dir.glob("*.tif")) + sorted(dem_dir.glob("*.tiff"))
+        if dem_files:
+            dem = DEMSampler(dem_files)
+            try:
+                generate_elevation_maps(
+                    poses, rotations, translations, ltp, dem, output_dir,
+                )
+            finally:
+                dem.close()
+
+    # 6.5 — XY point cloud projection (requires raw TIF paths and observations)
+    if (
+        raw_image_paths is not None
+        and observations is not None
+        and points is not None
+        and len(points) > 0
+    ):
+        from plot_errors import generate_xy_projection
+
+        generate_xy_projection(
+            poses, points, observations, raw_image_paths, output_dir,
+        )
+
+    # 6.6 — Per-camera reprojection overlay (RGB)
+    if observations is not None and points is not None and len(points) > 0:
+        from plot_errors import generate_reprojection_overlay
+
+        generate_reprojection_overlay(
+            poses, rotations, translations, points, observations, output_dir,
+        )
+
+    # 6.7 — Per-camera elevation reprojection
+    if observations is not None and points is not None and len(points) > 0:
+        from plot_errors import generate_elevation_reprojection
+
+        generate_elevation_reprojection(
+            poses, rotations, translations, points, observations, output_dir,
+        )
+
+    # 6.8 — Cross-camera reprojection check
+    if observations is not None and points is not None and len(points) > 0:
+        from plot_errors import generate_crosscam_reprojection
+
+        generate_crosscam_reprojection(
+            poses, rotations, translations, points, observations, output_dir,
+        )
+
+
+def _refine_focal_length(poses: list[FramePose]) -> None:
+    """
+    Refine the GSD-derived focal length using the RPC model.
+
+    For each frame with ``estimated_rpc``, project the image center and a
+    horizontal offset point to the ground via the NumPy RPC inverse,
+    measure the ground distance, and compute
+    ``f = altitude / (ground_distance / pixel_distance)``.
+
+    The per-frame focal lengths are averaged and applied to all frames,
+    overwriting the GSD-derived value.  This eliminates the ~0.2% radial
+    magnification error visible at image edges.
+    """
+    import math
+
+    logger.info("═══ Phase 1.5: Refining Focal Length from RPCs ═══")
+
+    focal_lengths: list[float] = []
+    offset_px = 1000  # horizontal pixel offset for measurement
+
+    for pose in poses:
+        if pose.rpc is None:
+            continue
+
+        cx, cy = pose.img_width / 2.0, pose.img_height / 2.0
+        lon1, lat1, _ = rpc_inverse(pose.rpc, cx, cy, alt_guess=0.0)
+        lon2, lat2, _ = rpc_inverse(pose.rpc, cx + offset_px, cy, alt_guess=0.0)
+
+        R_earth = 6371000.0
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = (
+            math.sin(dlat / 2) ** 2
+            + math.cos(math.radians(lat1))
+            * math.cos(math.radians(lat2))
+            * math.sin(dlon / 2) ** 2
+        )
+        ground_dist = R_earth * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+        if ground_dist <= 0:
+            continue
+
+        gsd_rpc = ground_dist / offset_px
+        if pose.acquisition_epoch is not None:
+            lat_s, lon_s, alt_s = ecef_to_geodetic(pose.C_sat)
+            f_rpc = alt_s / gsd_rpc
+        else:
+            f_rpc = 498000.0 / gsd_rpc
+
+        focal_lengths.append(f_rpc)
+
+    if not focal_lengths:
+        logger.warning("No frames with estimated_rpc — skipping focal length refinement.")
+        return
+
+    avg_f = float(np.mean(focal_lengths))
+    old_f = poses[0].focal_length_px
+
+    logger.info(
+        "  Refined focal length: %.1f px (was %.1f px, delta=%.1f px, %.3f%%)",
+        avg_f,
+        old_f,
+        avg_f - old_f,
+        (avg_f / old_f - 1) * 100,
+    )
+
+    # Apply to all frames
+    for pose in poses:
+        pose.focal_length_px = avg_f
 
 
 # ──────────────────────────── Main ─────────────────────────────────────────── #
@@ -359,6 +518,9 @@ def main() -> None:
     # Phase 1 — Metadata
     poses = step_parse_metadata(args.source_dir, args.rpc_type)
 
+    # Phase 1.5 — Refine focal length using RPC model
+    _refine_focal_length(poses)
+
     # Phase 2 — Coordinate transforms
     ltp, rotations, translations = step_compute_poses(poses, use_nadir=args.use_nadir)
 
@@ -372,18 +534,42 @@ def main() -> None:
         args.stride,
     )
 
+    # Phase 3.5 — Multi-view track merging
+    logger.info("═══ Phase 3.5: Multi-View Track Merging ═══")
+    points, observations = merge_multiview_tracks(
+        points,
+        observations,
+        poses,
+        rotations,
+        translations,
+        stride=args.stride,
+    )
+
     # Phase 4 — RPC validation (optional)
     rpc_results: list[RPCCheckResult | None] = []
     if not args.skip_rpc_check:
-        rpc_results = step_rpc_validation(poses, rotations, translations, ltp)
+        rpc_results = step_rpc_validation(
+            poses,
+            rotations,
+            translations,
+            ltp,
+            points=points,
+            observations=observations,
+        )
     else:
         logger.info("═══ Phase 4: RPC Validation — SKIPPED ═══")
+
+    # Save raw TIFF paths before image conversion overwrites them
+    # (needed for post-export RPC check which requires GDAL RPC metadata)
+    raw_tif_paths = [str(p.image_path) for p in poses]
 
     # Phase 4.25 — Convert images to 8-bit JPEG and generate nodata masks
     from undistort import convert_and_mask_images
 
     logger.info("═══ Phase 4.25: Converting Images & Generating Masks ═══")
-    image_paths = convert_and_mask_images(poses, args.output_dir)
+    image_paths = convert_and_mask_images(
+        poses, args.output_dir, percentile=args.scale_percentile
+    )
     for pose, ipath in zip(poses, image_paths):
         pose.image_path = ipath
 
@@ -451,6 +637,31 @@ def main() -> None:
         pinhole_height=pinhole_h,
     )
 
+    # Phase 5.5 — Post-export RPC consistency check
+    if not args.skip_rpc_check and len(points) > 0:
+        logger.info("═══ Phase 5.5: Post-Export RPC Consistency Check ═══")
+        verify_result = verify_colmap_points_against_rpc(
+            poses,
+            points,
+            observations,
+            ltp,
+            raw_image_paths=raw_tif_paths,
+        )
+        logger.info(
+            "  Checked %d point pairs:  %d passed, %d failed (threshold=%.1f px)",
+            verify_result["total_checked"],
+            verify_result["total_passed"],
+            verify_result["total_failed"],
+            verify_result["error_threshold"],
+        )
+        if verify_result["total_checked"] > 0:
+            logger.info(
+                "  Residuals:  mean=%.2f px   median=%.2f px   max=%.2f px",
+                verify_result["mean_error"],
+                verify_result["median_error"],
+                verify_result["max_error"],
+            )
+
     # Phase 6 — Diagnostics (optional)
     if not args.skip_diagnostics:
         step_diagnostics(
@@ -461,6 +672,10 @@ def main() -> None:
             points,
             args.output_dir,
             args.scale,
+            ltp=ltp,
+            dem_dir=args.dem_dir,
+            raw_image_paths=raw_tif_paths,
+            observations=observations,
         )
     else:
         logger.info("═══ Phase 6: Diagnostics — SKIPPED ═══")

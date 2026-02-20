@@ -215,7 +215,7 @@ def load_colmap_scene(colmap_path: pathlib.Path):
             camera_id=image_camera_ids[i],
             camera_metadata=loaded_cameras[image_camera_ids[i]],
             image_path=str(image_absolute_paths[i].absolute()),
-            mask_path=image_mask_absolute_paths[i],
+            mask_path=str(image_mask_absolute_paths[i]),
             point_indices=(
                 point_indices[image_colmap_ids[i]].copy()
                 if image_colmap_ids[i] in point_indices

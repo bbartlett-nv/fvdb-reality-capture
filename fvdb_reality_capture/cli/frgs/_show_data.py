@@ -157,7 +157,9 @@ class ShowData(BaseCommand):
         cam_up = np.array([0.0, 0.0, -1.0])
         if self.flip_up_axis:
             cam_up = -cam_up
-        if np.allclose(cam_eye - cam_lookat, cam_up):
+        view_dir = cam_lookat - cam_eye
+        view_norm = np.linalg.norm(view_dir)
+        if view_norm > 1e-12 and abs(np.dot(view_dir / view_norm, cam_up)) > 0.99:
             cam_up = np.array([0.0, 1.0, 0.0])
 
         viz_scene.set_camera_lookat(eye=cam_eye, center=cam_lookat, up=cam_up)

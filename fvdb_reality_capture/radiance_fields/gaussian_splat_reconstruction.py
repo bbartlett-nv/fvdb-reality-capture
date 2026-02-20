@@ -669,7 +669,11 @@ class GaussianSplatReconstruction:
                 )
                 camera_eye = self._sfm_scene.image_camera_positions[0]
                 camera_lookat = np.median(self._sfm_scene.points, axis=0)
-                camera_up = (0, 0, 1)
+                camera_up = np.array([0.0, 0.0, 1.0])
+                view_dir = camera_lookat - camera_eye
+                view_norm = np.linalg.norm(view_dir)
+                if view_norm > 1e-12 and abs(np.dot(view_dir / view_norm, camera_up)) > 0.99:
+                    camera_up = np.array([0.0, 1.0, 0.0])
                 self._viz_scene.set_camera_lookat(eye=camera_eye, center=camera_lookat, up=camera_up)
 
         # Losses & Metrics.

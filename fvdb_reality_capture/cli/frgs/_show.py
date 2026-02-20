@@ -98,10 +98,16 @@ class Show(BaseCommand):
             initial_camera_position = cam_to_world_matrices[0, :3, 3].cpu().numpy()
 
         logger.info(f"Setting scene camera to {initial_camera_position} looking at {scene_centroid}")
+        up = np.array([0.0, 0.0, -1.0])
+        view_dir = scene_centroid - initial_camera_position
+        view_norm = np.linalg.norm(view_dir)
+        if view_norm > 1e-12:
+            if abs(np.dot(view_dir / view_norm, up)) > 0.99:
+                up = np.array([0.0, 1.0, 0.0])
         viz_scene.set_camera_lookat(
             eye=initial_camera_position,
             center=scene_centroid,
-            up=[0, 0, -1],
+            up=up,
         )
 
         if cam_to_world_matrices is not None and projection_matrices is not None:

@@ -50,59 +50,87 @@ def _rem_dist_coeffs_normalised(focal_length_px: float) -> np.ndarray:
     ], dtype=np.float64)
 
 
-def _scale_to_uint8(img: np.ndarray) -> np.ndarray:
+def _scale_to_uint8(img: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
     """
     Scale a 16-bit (or higher) image to 8-bit [TARGET_MIN, TARGET_MAX]
-    using the valid pixel range (excluding nodata/zero pixels).
+    using the provided value range.
 
-    The same min/max linear stretch used for the distorted workflow.
+    Parameters
+    ----------
+    vmin, vmax : float
+        The low/high bounds for the linear stretch (typically from
+        percentile-based statistics computed across all images).
     """
     if img.dtype == np.uint8:
         return img
-
-    # Build a mask of valid (non-nodata) pixels
-    if img.ndim == 3:
-        valid = np.any(img != IMG_NODATA, axis=2)
-    else:
-        valid = img != IMG_NODATA
-
-    if not np.any(valid):
-        return np.zeros_like(img, dtype=np.uint8)
-
-    vmin = float(img[valid].min())
-    vmax = float(img[valid].max())
-
     if vmax <= vmin:
         return np.full_like(img, TARGET_MIN, dtype=np.uint8)
 
-    # Linear stretch to [TARGET_MIN, TARGET_MAX]
     scaled = (img.astype(np.float32) - vmin) / (vmax - vmin)
     scaled = scaled * (TARGET_MAX - TARGET_MIN) + TARGET_MIN
-    scaled = np.clip(scaled, TARGET_MIN, TARGET_MAX).astype(np.uint8)
-    return scaled
+    return np.clip(scaled, TARGET_MIN, TARGET_MAX).astype(np.uint8)
+
+
+def _compute_percentile_bounds(
+    poses: list[FramePose],
+    percentile: float = 2.0,
+) -> tuple[float, float]:
+    """
+    Compute the average (low, high) percentile bounds across all images,
+    using only valid (non-zero) pixels.
+
+    ``percentile=2.0`` means the 2nd percentile (dark) and 98th percentile
+    (bright) are used, clipping the darkest and brightest 2% of pixels.
+    The per-image percentiles are averaged to produce a single shared
+    ``(vmin, vmax)`` for consistent brightness across the strip.
+    """
+    lows: list[float] = []
+    highs: list[float] = []
+
+    for pose in poses:
+        img = cv2.imread(str(pose.image_path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            continue
+        # Extract valid (non-nodata) pixel values
+        if img.ndim == 3:
+            valid_mask = np.any(img != IMG_NODATA, axis=2)
+            valid_vals = img[valid_mask]
+        else:
+            valid_vals = img[img != IMG_NODATA]
+        if len(valid_vals) == 0:
+            continue
+        lows.append(float(np.percentile(valid_vals, percentile)))
+        highs.append(float(np.percentile(valid_vals, 100.0 - percentile)))
+
+    vmin = float(np.mean(lows)) if lows else 0.0
+    vmax = float(np.mean(highs)) if highs else 1.0
+    return vmin, vmax
 
 
 def convert_and_mask_images(
     poses: list[FramePose],
     output_dir: Path,
+    percentile: float = 2.0,
 ) -> list[Path]:
     """
     Convert raw 16-bit L1A TIFFs to 8-bit JPEGs and generate binary
     nodata masks.
 
-    For each raw TIFF:
-      1. Build a binary mask: pixel != 0 → 255, else 0
-      2. Scale the image to 8-bit JPEG using only valid (non-zero) pixels
-      3. Write the JPEG to ``output_dir/images/``
-      4. Write the mask PNG to ``output_dir/masks/``
+    Uses a two-pass approach for consistent brightness across the strip:
 
-    The mask filename follows the 3DGS convention:
-    ``{image_filename}.png`` (e.g. ``foo.jpg.png``).
+    **Pass 1**: Compute percentile-based scaling bounds averaged across
+    all images.
+
+    **Pass 2**: Apply the shared bounds to scale each image, write the
+    8-bit JPEG and binary mask.
 
     Parameters
     ----------
     poses : list[FramePose]
     output_dir : Path
+    percentile : float
+        Clip percentile for the linear stretch (default 2.0 means the
+        2nd and 98th percentiles are used as vmin/vmax).
 
     Returns
     -------
@@ -114,13 +142,21 @@ def convert_and_mask_images(
     images_dir.mkdir(parents=True, exist_ok=True)
     masks_dir.mkdir(parents=True, exist_ok=True)
 
+    # Pass 1: compute shared percentile bounds across all images
+    vmin, vmax = _compute_percentile_bounds(poses, percentile)
+    logger.info(
+        "Scaling bounds (p%.0f/p%.0f avg): vmin=%.1f  vmax=%.1f",
+        percentile, 100 - percentile, vmin, vmax,
+    )
+
+    # Pass 2: convert each image using the shared bounds
     image_paths: list[Path] = []
 
     for pose in poses:
         src_path = pose.image_path
         dst_name = src_path.stem + ".jpg"
         dst_path = images_dir / dst_name
-        mask_path = masks_dir / (dst_name + ".png")
+        mask_path = masks_dir / (src_path.stem + ".jpg")
 
         img = cv2.imread(str(src_path), cv2.IMREAD_UNCHANGED)
         if img is None:
@@ -135,11 +171,11 @@ def convert_and_mask_images(
             valid = img != IMG_NODATA
         mask = np.where(valid, np.uint8(255), np.uint8(0))
 
-        # Scale 16-bit to 8-bit using only valid pixels for min/max
-        scaled = _scale_to_uint8(img)
+        # Scale 16-bit to 8-bit using shared percentile bounds
+        scaled = _scale_to_uint8(img, vmin, vmax)
 
         cv2.imwrite(str(dst_path), scaled, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        cv2.imwrite(str(mask_path), mask)
+        cv2.imwrite(str(mask_path), mask, [cv2.IMWRITE_JPEG_QUALITY, 100])
         image_paths.append(dst_path)
 
     logger.info(
@@ -226,7 +262,7 @@ def undistort_images(
         undistorted_paths.append(dst_path)
 
         # Undistort the corresponding mask with nearest-neighbor interpolation
-        mask_name = src_path.name + ".png"
+        mask_name = src_path.stem + ".jpg"
         mask_src = masks_dir / mask_name
         if mask_src.exists():
             mask = cv2.imread(str(mask_src), cv2.IMREAD_GRAYSCALE)
@@ -240,7 +276,7 @@ def undistort_images(
                 # Re-binarize to ensure strictly 0/255
                 _, mask_undist = cv2.threshold(mask_undist, 128, 255, cv2.THRESH_BINARY)
                 # Overwrite the distorted mask with the undistorted one
-                mask_dst = masks_dir / (dst_path.name + ".png")
+                mask_dst = masks_dir / (dst_path.stem + ".jpg")
                 cv2.imwrite(str(mask_dst), mask_undist)
                 # Remove the old distorted mask if the name changed
                 if mask_dst != mask_src and mask_src.exists():

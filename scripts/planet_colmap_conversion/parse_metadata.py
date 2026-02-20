@@ -76,8 +76,11 @@ class FramePose:
     # RPC coefficients (filled if available)
     rpc: dict[str, Any] | None = None
 
-    # Satellite heading angle (degrees, from metadata)
+    # Satellite heading angle (degrees from north, from metadata)
     satellite_heading: float | None = None
+
+    # Off-nadir angle (degrees, from metadata extended.sat.off_nadir)
+    off_nadir_deg: float | None = None
 
     # Precise acquisition epoch (UNIX float, seconds since 1970-01-01 UTC).
     # Parsed from the filename timestamp (YYYYMMDD_HHMMSS_CC_SATID).
@@ -237,14 +240,11 @@ def _extract_focal_length(ext: dict) -> float:
 
 
 def _extract_rpcs(ext: dict, rpc_type: str = "estimated_rpc") -> dict[str, Any] | None:
-    """
-    Return the Rational Polynomial Coefficients block if present.
-
-    We prefer ``estimated_rpc`` but fall back to ``rpc`` or ``vendor_rpc``.
-    """
-    for key in (rpc_type, "rpc", "vendor_rpc"):
-        if key in ext:
-            return ext[key]
+    """Return the Rational Polynomial Coefficients block named *rpc_type*, or ``None``."""
+    if rpc_type in ext:
+        return ext[rpc_type]
+    logger.warning("RPC key '%s' not found in metadata (available: %s)",
+                   rpc_type, [k for k in ext if "rpc" in k.lower()])
     return None
 
 
@@ -316,7 +316,7 @@ def parse_l1a_metadata(
     image_id : int
         Unique COLMAP image ID (1-based).
     rpc_type : str
-        Which RPC block to use (``estimated_rpc`` | ``rpc`` | ``vendor_rpc``).
+        Which RPC block to use (default ``estimated_rpc``).
     """
     with open(metadata_path, "r") as fh:
         meta = json.load(fh)
@@ -330,16 +330,19 @@ def parse_l1a_metadata(
     timestamp = _extract_timestamp(ext)
     acquisition_epoch = _parse_acquisition_epoch(image_path)
 
-    # Satellite heading (if available)
+    # Satellite heading and off-nadir angle (if available)
     sat_block = ext.get("sat", {})
     heading = sat_block.get("satellite_azimuth_mean")
+    off_nadir_val = sat_block.get("off_nadir")
+    off_nadir = float(off_nadir_val) if off_nadir_val is not None else None
 
     logger.info(
-        "Parsed %s  —  pos=%.0f,%.0f,%.0f  f=%.1f px  epoch=%.3f",
+        "Parsed %s  —  pos=%.0f,%.0f,%.0f  f=%.1f px  epoch=%.3f  rpc=%s",
         metadata_path.name,
         *C_sat,
         focal_length_px,
         acquisition_epoch or 0.0,
+        rpc_type if rpc is not None else "NONE",
     )
 
     return FramePose(
@@ -351,6 +354,7 @@ def parse_l1a_metadata(
         focal_length_px=focal_length_px,
         rpc=rpc,
         satellite_heading=heading,
+        off_nadir_deg=off_nadir,
         acquisition_epoch=acquisition_epoch,
     )
 

@@ -249,6 +249,8 @@ class SfmDataset(torch.utils.data.Dataset, Iterable):
         if image.ndim == 2:
             image = image[:, :, None]
         image = camera_meta.undistort_image(image)
+        if image.shape[-1] == 1:
+            image = np.repeat(image, 3, axis=-1)
 
         projection_matrix = camera_meta.projection_matrix.copy()  # undistorted projection matrix
         camera_to_world_matrix = image_meta.camera_to_world_matrix.copy()
