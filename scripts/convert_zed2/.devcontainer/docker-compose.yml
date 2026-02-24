@@ -1,0 +1,25 @@
+# Copyright Contributors to the OpenVDB Project
+# SPDX-License-Identifier: Apache-2.0
+#
+# Docker Compose for the ZED2-to-COLMAP devcontainer.
+# Referenced by devcontainer.json -- not typically invoked directly.
+#
+# To mount your SVO data directory, set DATA_DIR before opening the container:
+#   export DATA_DIR=/path/to/svo/files
+
+services:
+  devcontainer:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ..:/workspace:cached
+      - ${DATA_DIR:-/data}:/data
+    command: sleep infinity
