@@ -5,6 +5,7 @@
 import pathlib
 from typing import Literal
 
+import numpy as np
 import torch
 from fvdb import GaussianSplat3d
 from fvdb.types import DeviceIdentifier, to_Mat33fBatch, to_Mat44fBatch, to_Vec2iBatch
@@ -15,6 +16,47 @@ from fvdb_reality_capture.tools import export_splats_to_usdz
 
 DatasetType = Literal["colmap", "simple_directory", "e57"]
 NearFarUnits = Literal["absolute", "camera_extent", "median_depth"]
+
+
+def estimate_scene_up(c2w: np.ndarray) -> np.ndarray:
+    """Estimate the scene up direction from the average camera up vector.
+
+    Cameras use the OpenCV convention (x-right, y-down, z-forward), so the
+    world-space "up" is the negative Y-axis of each camera-to-world rotation.
+
+    Args:
+        c2w: Camera-to-world matrices of shape ``(N, 4, 4)``.
+
+    Returns:
+        Unit-length up vector in world space, shape ``(3,)``.
+    """
+    R = c2w[:, :3, :3]
+    ups = np.sum(R * np.array([0, -1.0, 0]), axis=-1)
+    avg_up = np.mean(ups, axis=0)
+    norm = np.linalg.norm(avg_up)
+    if norm < 1e-6:
+        return np.array([0.0, 0.0, -1.0])
+    return avg_up / norm
+
+
+def avoid_gimbal_lock(eye: np.ndarray, center: np.ndarray, up: np.ndarray) -> np.ndarray:
+    """Return *up* unchanged unless it is nearly parallel to the view direction.
+
+    When the view direction (``center - eye``) is nearly parallel to *up*,
+    the orbit camera's cross-product degenerates (gimbal lock).  In that case
+    we return a perpendicular cardinal axis instead.
+    """
+    view_dir = center - eye
+    view_norm = np.linalg.norm(view_dir)
+    if view_norm < 1e-8:
+        return up
+    view_dir = view_dir / view_norm
+    if abs(np.dot(view_dir, up)) < 0.99:
+        return up
+    for candidate in [np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])]:
+        if abs(np.dot(view_dir, candidate)) < 0.9:
+            return candidate
+    return up
 
 
 def load_splats_from_file(path: pathlib.Path, device: DeviceIdentifier) -> tuple[GaussianSplat3d, dict]:

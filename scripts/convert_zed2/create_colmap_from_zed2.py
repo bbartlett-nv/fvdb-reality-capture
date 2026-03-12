@@ -5,16 +5,19 @@
 """
 Convert a ZED2 .svo recording into a COLMAP dataset compatible with ``frgs reconstruct``.
 
+By default the script exports ZED tracking poses directly (no refinement).
+Pass ``--refine`` to enable CUDA-accelerated pose refinement via cuSFM.
+
 Pipeline:
   Phase 1 -- Extract stereo frames, intrinsics, and ZED tracking poses from the .svo file.
-  Phase 2 -- Generate ``frames_meta.json`` in the cuSFM KeyframesMetadataCollection format.
-  Phase 3 -- Run cuSFM for CUDA-accelerated pose refinement (stereo-aware, with ZED pose priors).
-  Phase 4 -- Arrange the cuSFM sparse output into the COLMAP layout expected by frgs.
+  Phase 2 -- (--refine only) Generate ``frames_meta.json`` for cuSFM.
+  Phase 3 -- (--refine only) Run cuSFM for pose refinement (stereo-aware, with ZED pose priors).
+  Phase 4 -- Arrange the sparse output into the COLMAP layout expected by frgs.
 
 Requires:
   - ZED SDK with Python API (pyzed)
-  - pyCuSFM (cusfm_cli on PATH)
   - scipy, numpy, tqdm
+  - pyCuSFM (cusfm_cli on PATH) -- only when using --refine
 """
 
 import argparse
@@ -64,6 +67,46 @@ def _quaternion_to_axis_angle_dict(quat_xyzw: np.ndarray) -> dict:
     }
 
 
+def _enhance_clahe(sl_mat, clahe, path: str) -> None:
+    """Apply CLAHE to the L channel of a ZED ``sl.Mat`` and write to *path*."""
+    import cv2
+
+    bgra = sl_mat.get_data()
+    bgr = bgra[:, :, :3]
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    cv2.imwrite(path, enhanced)
+
+
+def _laplacian_variance(sl_mat) -> float:
+    """Return the variance of the Laplacian (higher = sharper)."""
+    import cv2
+
+    bgra = sl_mat.get_data()
+    gray = cv2.cvtColor(bgra[:, :, :3], cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+
+def _save_blur_histogram(values: list[float], threshold: float | None, path) -> None:
+    """Save a histogram of per-frame sharpness values to *path*."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.hist(values, bins=40, edgecolor="black", alpha=0.7)
+    if threshold and threshold > 0:
+        ax.axvline(threshold, color="red", linestyle="--", label=f"threshold = {threshold:.1f}")
+        ax.legend()
+    ax.set_xlabel("Laplacian Variance (sharpness)")
+    ax.set_ylabel("Frame Count")
+    ax.set_title("Blur Metric Distribution")
+    fig.tight_layout()
+    fig.savefig(str(path), dpi=120)
+    plt.close(fig)
+
+
 def extract_from_svo(
     svo_path: Path,
     work_dir: Path,
@@ -71,6 +114,8 @@ def extract_from_svo(
     image_format: str,
     extract_depth: bool = False,
     depth_stride: int = 8,
+    low_light: bool = False,
+    blur_threshold: float | None = None,
 ) -> dict:
     """
     Open a .svo file, enable positional tracking, and extract stereo frames,
@@ -94,6 +139,9 @@ def extract_from_svo(
     init_params.svo_real_time_mode = False
     init_params.coordinate_units = sl.UNIT.METER
     init_params.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Y_UP
+    if low_light:
+        init_params.depth_mode = sl.DEPTH_MODE.NEURAL
+        logger.info("Low-light mode: using NEURAL depth with relaxed confidence thresholds + CLAHE.")
 
     status = zed.open(init_params)
     if status != sl.ERROR_CODE.SUCCESS:
@@ -101,6 +149,9 @@ def extract_from_svo(
         sys.exit(1)
 
     tracking_params = sl.PositionalTrackingParameters()
+    tracking_params.mode = sl.POSITIONAL_TRACKING_MODE.GEN_3
+    if low_light:
+        tracking_params.enable_pose_smoothing = True
     zed.enable_positional_tracking(tracking_params)
 
     cam_info = zed.get_camera_information()
@@ -126,34 +177,69 @@ def extract_from_svo(
 
     left_dir = work_dir / LEFT_CAMERA_NAME
     right_dir = work_dir / RIGHT_CAMERA_NAME
-    left_dir.mkdir(parents=True, exist_ok=True)
-    right_dir.mkdir(parents=True, exist_ok=True)
+    for d in (left_dir, right_dir):
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True)
 
     left_image = sl.Mat()
     right_image = sl.Mat()
     pose = sl.Pose()
     pc_mat = sl.Mat() if extract_depth else None
 
+    runtime = sl.RuntimeParameters()
+    if low_light:
+        runtime.confidence_threshold = 100
+        runtime.texture_confidence_threshold = 100
+        runtime.enable_fill_mode = True
+
+    clahe = None
+    if low_light:
+        import cv2
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
     svo_length = zed.get_svo_number_of_frames()
     frames = []
     world_points_chunks: list[np.ndarray] = []
     frame_idx = 0
+    skipped_tracking = 0
+    skipped_blur = 0
+    sharpness_values: list[float] = []
     ext = f".{image_format}"
 
     logger.info("Extracting frames from SVO (%d total, stride=%d)...", svo_length, frame_stride)
 
     with tqdm(total=svo_length, desc="Extracting SVO frames") as pbar:
-        while zed.grab() == sl.ERROR_CODE.SUCCESS:
+        while zed.grab(runtime) == sl.ERROR_CODE.SUCCESS:
             if frame_idx % frame_stride == 0:
+                state = zed.get_position(pose, sl.REFERENCE_FRAME.WORLD)
+                if state != sl.POSITIONAL_TRACKING_STATE.OK:
+                    skipped_tracking += 1
+                    frame_idx += 1
+                    pbar.update(1)
+                    continue
+
                 zed.retrieve_image(left_image, sl.VIEW.LEFT)
                 zed.retrieve_image(right_image, sl.VIEW.RIGHT)
 
-                state = zed.get_position(pose, sl.REFERENCE_FRAME.WORLD)
+                if blur_threshold is not None:
+                    sharpness = _laplacian_variance(left_image)
+                    sharpness_values.append(sharpness)
+                    if blur_threshold > 0 and sharpness < blur_threshold:
+                        skipped_blur += 1
+                        frame_idx += 1
+                        pbar.update(1)
+                        continue
+
                 ts_ns = zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
 
                 img_name = f"{ts_ns}{ext}"
-                left_image.write(str(left_dir / img_name))
-                right_image.write(str(right_dir / img_name))
+                if clahe is not None:
+                    _enhance_clahe(left_image, clahe, str(left_dir / img_name))
+                    _enhance_clahe(right_image, clahe, str(right_dir / img_name))
+                else:
+                    left_image.write(str(left_dir / img_name))
+                    right_image.write(str(right_dir / img_name))
 
                 orientation = pose.get_orientation()
                 quat_xyzw = np.array(
@@ -203,6 +289,14 @@ def extract_from_svo(
     zed.disable_positional_tracking()
     zed.close()
 
+    if skipped_tracking > 0:
+        logger.warning("Skipped %d frames with unreliable tracking (state != OK).", skipped_tracking)
+    if skipped_blur > 0:
+        logger.warning("Skipped %d blurry frames (Laplacian variance < %.1f).", skipped_blur, blur_threshold)
+    if sharpness_values:
+        hist_path = work_dir / "blur_histogram.png"
+        _save_blur_histogram(sharpness_values, blur_threshold, hist_path)
+        logger.info("Saved blur histogram to %s", hist_path)
     logger.info("Extracted %d frame pairs from %d SVO frames.", len(frames), svo_length)
 
     world_points = None
@@ -574,7 +668,7 @@ def _write_extraction_metadata(extraction: dict, work_dir: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert a ZED2 .svo recording to a COLMAP dataset via cuSFM.",
+        description="Convert a ZED2 .svo recording to a COLMAP dataset. Pass --refine to enable cuSFM pose refinement.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--svo-path", type=Path, required=True, help="Path to the input .svo file.")
@@ -592,40 +686,64 @@ def main():
         "--image-format", choices=["jpeg", "png"], default="jpeg", help="Image format for extracted frames."
     )
     parser.add_argument(
+        "--refine",
+        action="store_true",
+        help="Enable cuSFM pose refinement instead of exporting ZED tracking poses directly.",
+    )
+    parser.add_argument(
         "--min-inter-frame-distance",
         type=float,
         default=0.06,
-        help="cuSFM minimum translational distance (meters) between keyframes.",
+        help="cuSFM minimum translational distance (meters) between keyframes. Requires --refine.",
     )
     parser.add_argument(
         "--min-inter-frame-rotation",
         type=float,
         default=1.5,
-        help="cuSFM minimum rotational change (degrees) between keyframes.",
+        help="cuSFM minimum rotational change (degrees) between keyframes. Requires --refine.",
     )
-    parser.add_argument("--skip-cusfm", action="store_true", help="Extract frames and metadata only; do not run cuSFM.")
     parser.add_argument(
-        "--no-refine",
+        "--skip-cusfm",
         action="store_true",
-        help="Export COLMAP dataset using ZED tracking poses directly, without cuSFM refinement.",
+        help="With --refine, stop after generating cuSFM metadata (do not run cuSFM).",
     )
     parser.add_argument(
         "--with-depth",
         action="store_true",
-        help="Replace cuSFM's feature-matched points with ZED depth points in the final output.",
+        help="Include ZED depth points in the output. Always on by default without --refine; with --refine, replaces cuSFM feature-matched points.",
     )
     parser.add_argument(
         "--depth-stride",
         type=int,
         default=8,
-        help="Pixel stride for depth point-cloud subsampling (used with --no-refine or --with-depth). Higher = fewer points.",
+        help="Pixel stride for depth point-cloud subsampling. Higher = fewer points.",
+    )
+    parser.add_argument(
+        "--low-light",
+        action="store_true",
+        help=(
+            "Optimize for under-exposed / low-light captures: use NEURAL depth mode, "
+            "relax depth-confidence thresholds, and apply CLAHE image enhancement. "
+            "Requires opencv-python."
+        ),
+    )
+    parser.add_argument(
+        "--blur-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Skip frames with Laplacian variance below this value (lower = blurrier). "
+            "Enabled automatically at 50.0 with --low-light. Set to 0 to disable."
+        ),
     )
     parser.add_argument(
         "--tight-poses",
         action="store_true",
-        help="Use tighter pose constraints for cuSFM (recommended for indoor ZED2 captures).",
+        help="Use tighter pose constraints for cuSFM (recommended for indoor ZED2 captures). Requires --refine.",
     )
-    parser.add_argument("--cusfm-extra-args", nargs="*", default=[], help="Additional arguments to pass to cusfm_cli.")
+    parser.add_argument(
+        "--cusfm-extra-args", nargs="*", default=[], help="Additional arguments to pass to cusfm_cli. Requires --refine."
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
 
     args = parser.parse_args()
@@ -644,11 +762,16 @@ def main():
     work_dir = args.work_dir.resolve() if args.work_dir else output_dir / "_work"
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    blur_threshold = args.blur_threshold
+    if blur_threshold is None and args.low_light:
+        blur_threshold = 50.0
+
     # Phase 1
     logger.info("=== Phase 1: Extracting from SVO ===")
     extraction = extract_from_svo(
         svo_path, work_dir, args.frame_stride, args.image_format,
-        extract_depth=args.no_refine or args.with_depth, depth_stride=args.depth_stride,
+        extract_depth=(not args.refine) or args.with_depth, depth_stride=args.depth_stride,
+        low_light=args.low_light, blur_threshold=blur_threshold,
     )
     _write_extraction_metadata(extraction, work_dir)
 
@@ -656,13 +779,8 @@ def main():
         logger.error("No frames extracted from SVO. Check the file and frame-stride setting.")
         sys.exit(1)
 
-    if args.no_refine:
-        # Direct export: write COLMAP binary from ZED poses, skip cuSFM entirely
-        logger.info("=== --no-refine: Writing COLMAP sparse from ZED poses ===")
-        sparse_dir = work_dir / "sparse_direct"
-        write_colmap_sparse_from_extraction(extraction, sparse_dir)
-    else:
-        # Phase 2
+    if args.refine:
+        # cuSFM pose-refinement pipeline
         logger.info("=== Phase 2: Generating frames_meta.json ===")
         generate_frames_meta(extraction, work_dir)
 
@@ -671,7 +789,6 @@ def main():
             logger.info("cuSFM input directory: %s", work_dir)
             return
 
-        # Phase 3
         logger.info("=== Phase 3: Running cuSFM ===")
         extra = list(args.cusfm_extra_args) if args.cusfm_extra_args else []
         if args.tight_poses:
@@ -689,6 +806,11 @@ def main():
             logger.info("=== --with-depth: Replacing cuSFM points3D.bin with ZED depth points ===")
             n = _write_points3d_bin(sparse_dir / "points3D.bin", extraction["world_points"])
             logger.info("Wrote %d ZED depth points to %s", n, sparse_dir / "points3D.bin")
+    else:
+        # Default: direct COLMAP export from ZED tracking poses
+        logger.info("=== Writing COLMAP sparse from ZED poses (no refinement) ===")
+        sparse_dir = work_dir / "sparse_direct"
+        write_colmap_sparse_from_extraction(extraction, sparse_dir)
 
     # Phase 4
     logger.info("=== Phase 4: Arranging COLMAP output ===")

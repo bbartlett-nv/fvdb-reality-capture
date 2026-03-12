@@ -17,7 +17,7 @@ from tyro.conf import arg
 
 from fvdb_reality_capture.cli import BaseCommand
 
-from ._common import load_splats_from_file
+from ._common import avoid_gimbal_lock, estimate_scene_up, load_splats_from_file
 
 
 @dataclass
@@ -97,11 +97,17 @@ class Show(BaseCommand):
         else:
             initial_camera_position = cam_to_world_matrices[0, :3, 3].cpu().numpy()
 
+        if cam_to_world_matrices is not None:
+            cam_up = estimate_scene_up(cam_to_world_matrices.numpy())
+        else:
+            cam_up = np.array([0.0, 0.0, -1.0])
+        cam_up = avoid_gimbal_lock(initial_camera_position, scene_centroid, cam_up)
+
         logger.info(f"Setting scene camera to {initial_camera_position} looking at {scene_centroid}")
         viz_scene.set_camera_lookat(
             eye=initial_camera_position,
             center=scene_centroid,
-            up=[0, 0, -1],
+            up=cam_up,
         )
 
         if cam_to_world_matrices is not None and projection_matrices is not None:

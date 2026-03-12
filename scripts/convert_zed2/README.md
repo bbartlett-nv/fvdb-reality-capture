@@ -1,8 +1,9 @@
-# ZED2 SVO to COLMAP Conversion (via cuSFM)
+# ZED2 SVO to COLMAP Conversion
 
 Convert a ZED2 `.svo` recording into a COLMAP dataset compatible with
-`frgs reconstruct`, using NVIDIA cuSFM for CUDA-accelerated pose refinement
-with ZED stereo-pair and tracking-pose priors.
+`frgs reconstruct`.  By default the script exports ZED tracking poses
+directly.  Pass `--refine` to enable CUDA-accelerated pose refinement via
+NVIDIA cuSFM (stereo-aware, with ZED tracking-pose priors).
 
 ## Prerequisites
 
@@ -25,9 +26,16 @@ with ZED stereo-pair and tracking-pose priors.
 4. Inside the container terminal, run:
 
    ```bash
+   # Default: export ZED tracking poses directly (no refinement)
    python create_colmap_from_zed2.py \
        --svo-path /data/recording.svo \
        --output-dir /data/colmap_output
+
+   # Optional: enable cuSFM pose refinement
+   python create_colmap_from_zed2.py \
+       --svo-path /data/recording.svo \
+       --output-dir /data/colmap_output \
+       --refine
    ```
 
 5. Back on the host, train a 3DGS model:
@@ -44,7 +52,7 @@ If you prefer not to use devcontainers, build and run directly:
 # Build from the convert_zed2/ directory
 docker compose -f .devcontainer/docker-compose.yml build
 
-# Run the conversion
+# Run the conversion (default: direct export, no refinement)
 docker compose -f .devcontainer/docker-compose.yml run --rm devcontainer \
     python create_colmap_from_zed2.py \
         --svo-path /data/recording.svo \
@@ -64,9 +72,13 @@ Key flags:
 | `--svo-path` | (required) | Path to the input `.svo` file |
 | `--output-dir` | (required) | Output COLMAP dataset directory |
 | `--frame-stride` | `5` | Extract every Nth frame |
-| `--min-inter-frame-distance` | `0.06` | cuSFM keyframe distance threshold (meters) |
-| `--min-inter-frame-rotation` | `1.5` | cuSFM keyframe rotation threshold (degrees) |
-| `--skip-cusfm` | off | Extract frames + metadata only (skip SfM) |
+| `--refine` | off | Enable cuSFM pose refinement |
+| `--min-inter-frame-distance` | `0.06` | cuSFM keyframe distance threshold (meters, requires `--refine`) |
+| `--min-inter-frame-rotation` | `1.5` | cuSFM keyframe rotation threshold (degrees, requires `--refine`) |
+| `--skip-cusfm` | off | With `--refine`, stop after metadata generation |
+| `--with-depth` | off | With `--refine`, replace cuSFM points with ZED depth |
+| `--low-light` | off | Optimize for under-exposed captures (NEURAL depth, relaxed confidence, CLAHE enhancement) |
+| `--blur-threshold` | off (`50.0` with `--low-light`) | Skip frames with Laplacian variance below this value (lower = blurrier) |
 | `--verbose` | off | Debug logging |
 
 ## Pipeline overview
@@ -77,13 +89,13 @@ ZED2 .svo
   v
 Phase 1: Extract stereo frames + ZED tracking poses + intrinsics  (pyzed)
   |
-  v
-Phase 2: Generate frames_meta.json  (cuSFM KeyframesMetadataCollection format)
-  |
-  v
-Phase 3: Run cuSFM  (CUDA-accelerated SfM with stereo + pose priors)
-  |
-  v
+  |--- (default) -----> Write COLMAP sparse from ZED poses directly
+  |                        |
+  |--- (--refine) -----> Phase 2: Generate frames_meta.json
+  |                        |
+  |                      Phase 3: Run cuSFM  (CUDA-accelerated SfM)
+  |                        |
+  v                        v
 Phase 4: Arrange COLMAP output  (images/ + sparse/0/ layout for frgs)
   |
   v

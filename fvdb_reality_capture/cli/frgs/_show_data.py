@@ -23,7 +23,7 @@ from fvdb_reality_capture.transforms import (
     PercentileFilterPoints,
 )
 
-from ._common import DatasetType, load_sfm_scene
+from ._common import DatasetType, avoid_gimbal_lock, estimate_scene_up, load_sfm_scene
 
 
 def center_and_scale_scene(
@@ -150,15 +150,12 @@ class ShowData(BaseCommand):
 
         cam_positions = sfm_scene.camera_to_world_matrices[:, 0:3, 3]
 
-        # Find a camera whose position is far from the scene centroid and
-        # whose up vector is not aligned with the view direction.
         cam_eye = cam_positions[0]
         cam_lookat = sfm_scene.points.mean(0)
-        cam_up = np.array([0.0, 0.0, -1.0])
+        cam_up = estimate_scene_up(sfm_scene.camera_to_world_matrices)
         if self.flip_up_axis:
             cam_up = -cam_up
-        if np.allclose(cam_eye - cam_lookat, cam_up):
-            cam_up = np.array([0.0, 1.0, 0.0])
+        cam_up = avoid_gimbal_lock(cam_eye, cam_lookat, cam_up)
 
         viz_scene.set_camera_lookat(eye=cam_eye, center=cam_lookat, up=cam_up)
 
