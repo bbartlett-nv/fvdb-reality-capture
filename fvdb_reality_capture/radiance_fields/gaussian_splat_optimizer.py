@@ -525,6 +525,41 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
         self._update_optimizer_params_and_state(lambda x: x[indices_or_mask])
 
     @torch.no_grad()
+    def prune(self, use_scale_threshold: bool = True) -> dict[str, int]:
+        """Delete low-opacity or oversized Gaussians without inserting new ones.
+
+        Unlike :meth:`refine`, this operation is independent of ``max_gaussians`` and does not
+        advance the refinement schedule, reset opacities, or use screen-space scale history.
+        Gradients and Adam state for surviving Gaussians are preserved so pruning can safely run
+        between ``backward()`` and ``step()``.
+
+        Args:
+            use_scale_threshold: Also delete Gaussians whose largest 3D scale exceeds
+                :attr:`GaussianSplatOptimizerConfig.deletion_scale_3d_threshold`.
+
+        Returns:
+            A dictionary containing the number of deleted Gaussians under ``"num_deleted"``.
+        """
+        is_deleted = self._compute_deletion_mask(
+            use_scales_for_deletion=use_scale_threshold,
+            use_screen_space_scales_for_deletion=False,
+        )
+        num_deleted = int(is_deleted.sum().item())
+        num_gaussians_before_pruning = self._model.num_gaussians
+
+        if num_deleted > 0:
+            # Integer indices follow the same Torch-DGX-safe filtering path as refinement.
+            keep_indices = torch.where(~is_deleted)[0]
+            self.filter_gaussians(keep_indices)
+
+        self._logger.debug(
+            f"Optimizer prune-only step (optimizer step {self._step_count:,}): {num_deleted:,} pruned. "
+            f"Before pruning model had {num_gaussians_before_pruning:,} Gaussians, after pruning has "
+            f"{self._model.num_gaussians:,} Gaussians."
+        )
+        return {"num_deleted": num_deleted}
+
+    @torch.no_grad()
     def refine(self, zero_gradients: bool = True) -> dict[str, int]:
         """
         Perform a step of refinement by inserting Gaussians where more detail is needed and deleting Gaussians that are

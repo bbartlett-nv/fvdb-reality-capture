@@ -3493,6 +3493,114 @@ class TestEvaluateSphericalHarmonics(unittest.TestCase):
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+class TestGaussianRenderCrops(BaseGaussianTestCase):
+    """Test crop rendering against slices of a full-frame render."""
+
+    tile_size = 16
+
+    def _project(self, gs3d=None):
+        if gs3d is None:
+            gs3d = self.gs3d
+        return gs3d.project_gaussians_for_images(
+            self.cam_to_world_mats[:1],
+            self.projection_mats[:1],
+            self.width,
+            self.height,
+            self.near_plane,
+            self.far_plane,
+            sh_degree_to_use=0,
+        )
+
+    def _assert_crop_matches_full_render(self, x, y, width, height):
+        with torch.no_grad():
+            projected = self._project()
+            full, full_alphas = self.gs3d.render_from_projected_gaussians(
+                projected,
+                tile_size=self.tile_size,
+            )
+            crop, crop_alphas = self.gs3d.render_from_projected_gaussians(
+                projected,
+                crop_width=width,
+                crop_height=height,
+                crop_origin_w=x,
+                crop_origin_h=y,
+                tile_size=self.tile_size,
+            )
+
+        self.assertEqual(crop.shape, (1, height, width, self.gs3d.num_channels))
+        self.assertEqual(crop_alphas.shape, (1, height, width, 1))
+        torch.testing.assert_close(crop, full[:, y : y + height, x : x + width], rtol=0.0, atol=1e-6)
+        torch.testing.assert_close(crop_alphas, full_alphas[:, y : y + height, x : x + width], rtol=0.0, atol=1e-6)
+
+    def _clone_gaussians(self):
+        gs3d = GaussianSplat3d.from_tensors(
+            means=self.gs3d.means,
+            quats=self.gs3d.quats,
+            log_scales=self.gs3d.log_scales,
+            logit_opacities=self.gs3d.logit_opacities,
+            sh0=self.gs3d.sh0,
+            shN=self.gs3d.shN,
+            detach=True,
+        )
+        gs3d.requires_grad = True
+        return gs3d
+
+    def test_tile_aligned_crop_matches_full_render(self):
+        self._assert_crop_matches_full_render(x=304, y=48, width=64, height=64)
+
+    def test_non_tile_aligned_crop_matches_full_render(self):
+        self._assert_crop_matches_full_render(x=303, y=47, width=73, height=59)
+
+    def test_crop_ending_at_image_edge_matches_full_render(self):
+        width = 73
+        height = 59
+        self._assert_crop_matches_full_render(
+            x=self.width - width,
+            y=self.height - height,
+            width=width,
+            height=height,
+        )
+
+    def test_non_tile_aligned_crop_backward_matches_full_render(self):
+        x, y, width, height = 303, 47, 64, 64
+        full_gs3d = self._clone_gaussians()
+        crop_gs3d = self._clone_gaussians()
+
+        full, full_alphas = full_gs3d.render_from_projected_gaussians(
+            self._project(full_gs3d),
+            tile_size=self.tile_size,
+        )
+        crop, crop_alphas = crop_gs3d.render_from_projected_gaussians(
+            self._project(crop_gs3d),
+            crop_width=width,
+            crop_height=height,
+            crop_origin_w=x,
+            crop_origin_h=y,
+            tile_size=self.tile_size,
+        )
+        full = full[:, y : y + height, x : x + width]
+        full_alphas = full_alphas[:, y : y + height, x : x + width]
+
+        torch.testing.assert_close(crop, full, rtol=0.0, atol=1e-6)
+        torch.testing.assert_close(crop_alphas, full_alphas, rtol=0.0, atol=1e-6)
+
+        pixel_weights = torch.linspace(0.5, 1.5, width * height, device=self.device).reshape(1, height, width, 1)
+        channel_weights = torch.tensor([0.7, 1.1, 1.3], device=self.device).reshape(1, 1, 1, 3)
+        full_loss = (full * pixel_weights * channel_weights).mean() + (full_alphas * pixel_weights).mean()
+        crop_loss = (crop * pixel_weights * channel_weights).mean() + (crop_alphas * pixel_weights).mean()
+        full_loss.backward()
+        crop_loss.backward()
+
+        for parameter_name in ("means", "quats", "log_scales", "logit_opacities", "sh0"):
+            with self.subTest(parameter=parameter_name):
+                full_gradient = getattr(full_gs3d, parameter_name).grad
+                crop_gradient = getattr(crop_gs3d, parameter_name).grad
+                self.assertIsNotNone(full_gradient)
+                self.assertIsNotNone(crop_gradient)
+                torch.testing.assert_close(full_gradient, crop_gradient, rtol=2e-4, atol=1e-5)
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
 class TestGaussianRenderMasks(BaseGaussianTestCase):
     """Test mask support across dense, sparse, and jagged render paths."""
 
@@ -3516,6 +3624,19 @@ class TestGaussianRenderMasks(BaseGaussianTestCase):
 
     def _all_zeros_tile_mask(self, C):
         return torch.zeros((C, self.num_tiles_h, self.num_tiles_w), device=self.device, dtype=torch.bool)
+
+    def _clone_gaussians(self):
+        gs3d = GaussianSplat3d.from_tensors(
+            means=self.gs3d.means,
+            quats=self.gs3d.quats,
+            log_scales=self.gs3d.log_scales,
+            logit_opacities=self.gs3d.logit_opacities,
+            sh0=self.gs3d.sh0,
+            shN=self.gs3d.shN,
+            detach=True,
+        )
+        gs3d.requires_grad = True
+        return gs3d
 
     # -- Dense: render_images ------------------------------------------------
 
@@ -3677,6 +3798,168 @@ class TestGaussianRenderMasks(BaseGaussianTestCase):
         expected = bg.view(C, 1, 1, D).expand(C, self.height, self.width, D)
         self.assertTrue(torch.equal(out_z_a, torch.zeros_like(out_z_a)))
         self.assertTrue(torch.equal(out_z, expected))
+
+    def test_render_from_projected_gaussians_with_tile_masks(self):
+        C = 1
+        D = 3
+        projected = self.gs3d.project_gaussians_for_images(
+            self.cam_to_world_mats[:C],
+            self.projection_mats[:C],
+            self.width,
+            self.height,
+            self.near_plane,
+            self.far_plane,
+        )
+        bg = torch.tensor([[0.1, -0.2, 0.3]], device=self.device, dtype=torch.float32)
+
+        ref, ref_a = self.gs3d.render_from_projected_gaussians(projected, backgrounds=bg)
+        out, out_a = self.gs3d.render_from_projected_gaussians(
+            projected,
+            backgrounds=bg,
+            tile_masks=self._all_ones_tile_mask(C),
+        )
+        torch.testing.assert_close(out, ref)
+        torch.testing.assert_close(out_a, ref_a)
+
+        out_z, out_z_a = self.gs3d.render_from_projected_gaussians(
+            projected,
+            backgrounds=bg,
+            tile_masks=self._all_zeros_tile_mask(C),
+        )
+        expected = bg.view(C, 1, 1, D).expand(C, self.height, self.width, D)
+        self.assertTrue(torch.equal(out_z, expected))
+        self.assertTrue(torch.equal(out_z_a, torch.zeros_like(out_z_a)))
+
+    def test_render_from_projected_gaussians_rejects_pixel_and_tile_masks(self):
+        C = 1
+        projected = self.gs3d.project_gaussians_for_images(
+            self.cam_to_world_mats[:C],
+            self.projection_mats[:C],
+            self.width,
+            self.height,
+            self.near_plane,
+            self.far_plane,
+        )
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            self.gs3d.render_from_projected_gaussians(
+                projected,
+                masks=self._all_ones_pixel_mask(C),
+                tile_masks=self._all_ones_tile_mask(C),
+            )
+
+    def test_render_from_projected_gaussians_validates_tile_mask_shape_and_dtype(self):
+        C = 1
+        projected = self.gs3d.project_gaussians_for_images(
+            self.cam_to_world_mats[:C],
+            self.projection_mats[:C],
+            self.width,
+            self.height,
+            self.near_plane,
+            self.far_plane,
+        )
+
+        invalid_shape = torch.ones(
+            (C, self.num_tiles_h, self.num_tiles_w - 1), device=self.device, dtype=torch.bool
+        )
+        with self.assertRaisesRegex(ValueError, "tile_masks must have shape"):
+            self.gs3d.render_from_projected_gaussians(projected, tile_masks=invalid_shape)
+
+        invalid_dtype = self._all_ones_tile_mask(C).float()
+        with self.assertRaisesRegex(TypeError, "tile_masks must have dtype torch.bool"):
+            self.gs3d.render_from_projected_gaussians(projected, tile_masks=invalid_dtype)
+
+    def test_render_from_projected_gaussians_mixed_tile_mask_backward_matches_selected_full_render(self):
+        C = 1
+        full_gs3d = self._clone_gaussians()
+        masked_gs3d = self._clone_gaussians()
+        full_projected = full_gs3d.project_gaussians_for_images(
+            self.cam_to_world_mats[:C],
+            self.projection_mats[:C],
+            self.width,
+            self.height,
+            self.near_plane,
+            self.far_plane,
+        )
+        masked_projected = masked_gs3d.project_gaussians_for_images(
+            self.cam_to_world_mats[:C],
+            self.projection_mats[:C],
+            self.width,
+            self.height,
+            self.near_plane,
+            self.far_plane,
+        )
+
+        tile_rows = torch.arange(self.num_tiles_h, device=self.device).reshape(1, self.num_tiles_h, 1)
+        tile_columns = torch.arange(self.num_tiles_w, device=self.device).reshape(1, 1, self.num_tiles_w)
+        tile_masks = (tile_rows + tile_columns) % 2 == 0
+        self.assertTrue(tile_masks.any())
+        self.assertTrue((~tile_masks).any())
+
+        full, full_alphas = full_gs3d.render_from_projected_gaussians(
+            full_projected,
+            tile_size=self.tile_size,
+        )
+        masked, masked_alphas = masked_gs3d.render_from_projected_gaussians(
+            masked_projected,
+            tile_size=self.tile_size,
+            tile_masks=tile_masks,
+        )
+
+        pixel_mask = tile_masks.repeat_interleave(self.tile_size, dim=1).repeat_interleave(
+            self.tile_size, dim=2
+        )
+        pixel_mask = pixel_mask[:, : self.height, : self.width].unsqueeze(-1)
+        torch.testing.assert_close(masked, full * pixel_mask, rtol=0.0, atol=1e-6)
+        torch.testing.assert_close(masked_alphas, full_alphas * pixel_mask, rtol=0.0, atol=1e-6)
+
+        pixel_weights = torch.linspace(0.5, 1.5, self.height * self.width, device=self.device).reshape(
+            1, self.height, self.width, 1
+        )
+        channel_weights = torch.tensor([0.7, 1.1, 1.3], device=self.device).reshape(1, 1, 1, 3)
+        full_loss = (full * pixel_mask * pixel_weights * channel_weights).mean()
+        full_loss = full_loss + (full_alphas * pixel_mask * pixel_weights).mean()
+        masked_loss = (masked * pixel_weights * channel_weights).mean()
+        masked_loss = masked_loss + (masked_alphas * pixel_weights).mean()
+        full_loss.backward()
+        masked_loss.backward()
+
+        for parameter_name in ("means", "quats", "log_scales", "logit_opacities", "sh0", "shN"):
+            with self.subTest(parameter=parameter_name):
+                full_gradient = getattr(full_gs3d, parameter_name).grad
+                masked_gradient = getattr(masked_gs3d, parameter_name).grad
+                self.assertIsNotNone(full_gradient)
+                self.assertIsNotNone(masked_gradient)
+                torch.testing.assert_close(full_gradient, masked_gradient, rtol=2e-4, atol=1e-5)
+
+    def test_render_from_projected_gaussians_all_zero_tile_mask_backward_has_zero_gradients(self):
+        C = 1
+        gs3d = self._clone_gaussians()
+        projected = gs3d.project_gaussians_for_images(
+            self.cam_to_world_mats[:C],
+            self.projection_mats[:C],
+            self.width,
+            self.height,
+            self.near_plane,
+            self.far_plane,
+        )
+        rendered, alphas = gs3d.render_from_projected_gaussians(
+            projected,
+            tile_size=self.tile_size,
+            tile_masks=self._all_zeros_tile_mask(C),
+        )
+
+        self.assertTrue(rendered.requires_grad)
+        self.assertTrue(alphas.requires_grad)
+        self.assertTrue(torch.equal(rendered, torch.zeros_like(rendered)))
+        self.assertTrue(torch.equal(alphas, torch.zeros_like(alphas)))
+        (rendered.sum() + alphas.sum()).backward()
+
+        for parameter_name in ("means", "quats", "log_scales", "logit_opacities", "sh0", "shN"):
+            with self.subTest(parameter=parameter_name):
+                gradient = getattr(gs3d, parameter_name).grad
+                self.assertIsNotNone(gradient)
+                torch.testing.assert_close(gradient, torch.zeros_like(gradient), rtol=0.0, atol=0.0)
 
     # -- Sparse: sparse_render_images ----------------------------------------
 

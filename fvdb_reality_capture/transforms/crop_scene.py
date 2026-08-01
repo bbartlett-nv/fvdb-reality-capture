@@ -14,8 +14,122 @@ from fvdb.types import NumericMaxRank1, to_VecNf
 from scipy.spatial import ConvexHull
 
 from fvdb_reality_capture.sfm_scene import SfmCache, SfmPosedImageMetadata, SfmScene
+from fvdb_reality_capture.sfm_scene.scene_attribute import CROP_MASK_BBOX_ATTRIBUTE, PerImageValueAttribute
 
 from .base_transform import BaseTransform, transform
+
+_MASK_BBOX_MANIFEST_VERSION = 1
+_MASK_BBOX_MANIFEST_VERSION_KEY = "crop_mask_bbox_manifest_version"
+_MASK_BBOX_IMAGE_IDS_KEY = "crop_mask_bbox_image_ids"
+_MAX_RASTER_WORKSPACE_BYTES = 64 * 1024 * 1024
+
+
+def _mask_bbox_xyxy_count(mask: np.ndarray) -> np.ndarray:
+    """Return ``[xmin, ymin, xmax, ymax, count]`` for pixels that are valid under dataset mask semantics."""
+    if mask.ndim == 3:
+        mask = mask[..., 0]
+    elif mask.ndim != 2:
+        raise ValueError(f"Unsupported mask shape: {mask.shape}. Must have 2D or 3D shape.")
+
+    if mask.dtype == np.bool_:
+        valid = mask
+    else:
+        is_normalized = mask.size > 0 and np.max(mask) <= 1
+        if np.issubdtype(mask.dtype, np.floating):
+            # Normalized floating-point masks use conventional probability semantics.
+            threshold = 0.5 if is_normalized else 127
+        else:
+            # Binary integer masks use 0/1, while byte-range masks use 0/255.
+            threshold = 0 if is_normalized else 127
+        valid = mask > threshold
+    valid_count = int(np.count_nonzero(valid))
+    if valid_count == 0:
+        return np.zeros((5,), dtype=np.int64)
+
+    valid_rows = np.flatnonzero(np.any(valid, axis=1))
+    valid_columns = np.flatnonzero(np.any(valid, axis=0))
+    return np.array(
+        [valid_columns[0], valid_rows[0], valid_columns[-1] + 1, valid_rows[-1] + 1, valid_count],
+        dtype=np.int64,
+    )
+
+
+def _read_mask(mask_path: str) -> np.ndarray:
+    if mask_path.strip().endswith(".npy"):
+        return np.load(mask_path)
+    if mask_path.strip().endswith((".png", ".jpg", ".jpeg")):
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise ValueError(f"Failed to load mask {mask_path}")
+        return mask
+    raise ValueError(f"Unsupported mask file format: {mask_path}")
+
+
+def _rasterize_convex_hull_mask(convex_hull: ConvexHull, image_height: int, image_width: int) -> np.ndarray:
+    """Rasterize a 2D convex hull with the existing integer-pixel, closed-half-space semantics.
+
+    Processing only the hull's clipped image-space bounds in bounded row chunks avoids the full-image
+    ``[H, W, 2]`` coordinate grid and ``[H, W, num_edges]`` distance tensors used previously.
+    ``cv2.fillConvexPoly`` is deliberately not used here because its sub-pixel edge coverage differs from
+    the existing closed-half-space test by boundary pixels.
+    """
+    inside_mask = np.zeros((image_height, image_width), dtype=bool)
+    hull_vertices = convex_hull.points[convex_hull.vertices]
+
+    min_x = max(0, int(np.ceil(np.min(hull_vertices[:, 0]))))
+    max_x = min(image_width, int(np.floor(np.max(hull_vertices[:, 0]))) + 1)
+    min_y = max(0, int(np.ceil(np.min(hull_vertices[:, 1]))))
+    max_y = min(image_height, int(np.floor(np.max(hull_vertices[:, 1]))) + 1)
+    if min_x >= max_x or min_y >= max_y:
+        return inside_mask
+
+    hull_normals = convex_hull.equations[:, :-1]
+    hull_offsets = convex_hull.equations[:, -1]
+    bounded_width = max_x - min_x
+    bytes_per_pixel = np.dtype(np.int64).itemsize * 2 + np.dtype(np.float64).itemsize * len(hull_offsets) + 1
+    rows_per_chunk = max(1, _MAX_RASTER_WORKSPACE_BYTES // max(1, bounded_width * bytes_per_pixel))
+
+    pixel_u = np.arange(min_x, max_x)
+    for row_start in range(min_y, max_y, rows_per_chunk):
+        row_stop = min(max_y, row_start + rows_per_chunk)
+        pixel_v = np.arange(row_start, row_stop)
+        grid_u, grid_v = np.meshgrid(pixel_u, pixel_v, indexing="xy")
+        pixel_coords = np.stack([grid_u, grid_v], axis=-1)
+        signed_distances = pixel_coords @ hull_normals.T + hull_offsets[np.newaxis, np.newaxis, :]
+        inside_mask[row_start:row_stop, min_x:max_x] = np.all(signed_distances <= 0.0, axis=-1)
+
+    return inside_mask
+
+
+def _get_cached_mask_bboxes(transform_data: dict, image_ids: np.ndarray) -> np.ndarray | None:
+    if transform_data.get(_MASK_BBOX_MANIFEST_VERSION_KEY) != _MASK_BBOX_MANIFEST_VERSION:
+        return None
+
+    cached_image_ids = np.asarray(transform_data.get(_MASK_BBOX_IMAGE_IDS_KEY, []), dtype=np.int64)
+    cached_bboxes = np.asarray(transform_data.get(CROP_MASK_BBOX_ATTRIBUTE, []), dtype=np.int64)
+    if cached_image_ids.shape != image_ids.shape or not np.array_equal(cached_image_ids, image_ids):
+        return None
+    if cached_bboxes.shape != (len(image_ids), 5):
+        return None
+    return cached_bboxes
+
+
+def _write_transform_manifest(
+    output_cache: SfmCache,
+    transformation_matrix: np.ndarray,
+    image_ids: np.ndarray,
+    mask_bboxes: np.ndarray,
+) -> None:
+    output_cache.write_file(
+        "transform",
+        {
+            "transform": transformation_matrix,
+            _MASK_BBOX_MANIFEST_VERSION_KEY: _MASK_BBOX_MANIFEST_VERSION,
+            _MASK_BBOX_IMAGE_IDS_KEY: image_ids,
+            CROP_MASK_BBOX_ATTRIBUTE: mask_bboxes,
+        },
+        data_type="pt",
+    )
 
 
 def _crop_scene_to_bbox(
@@ -58,13 +172,16 @@ def _crop_scene_to_bbox(
 
     # How many zeros to pad the image index in the mask file names
     num_zeropad = len(str(len(masked_scene.images))) + 2
+    image_ids = np.asarray([image.image_id for image in masked_scene.images], dtype=np.int64)
 
     new_image_metadata = []
+    cached_mask_paths: list[str] = []
+    transform_data: dict = {}
 
     regenerate_cache = False
     if output_cache.num_files != len(masked_scene.images) + 1:
         if output_cache.num_files == 0:
-            logger.info(f"No masks found in the cache for cropping.")
+            logger.info("No masks found in the cache for cropping.")
         else:
             logger.info(
                 f"Inconsistent number of masks for images. Expected {len(masked_scene.images)}, found {output_cache.num_files}. "
@@ -73,37 +190,45 @@ def _crop_scene_to_bbox(
         output_cache.clear_current_folder()
         regenerate_cache = True
     if output_cache.has_file("transform"):
-        _, transform_data = output_cache.read_file("transform")
-        cached_transform: np.ndarray | None = transform_data.get("transform", None)
-        if cached_transform is None:
-            logger.info(f"Transform metadata does not match expected format. No 'transform' key in cached file.")
+        _, loaded_transform_data = output_cache.read_file("transform")
+        if not isinstance(loaded_transform_data, dict):
+            logger.info("Transform metadata does not match expected format. Clearing cache and regenerating transform.")
             output_cache.clear_current_folder()
             regenerate_cache = True
-        elif not isinstance(cached_transform, np.ndarray) or cached_transform.shape != (4, 4):
-            logger.info(
-                f"Transform metadata does not match expected format. Expected 'transform'."
-                f"Clearing the cache and regenerating transform."
-            )
-            output_cache.clear_current_folder()
-            regenerate_cache = True
-        elif not np.allclose(cached_transform, input_scene.transformation_matrix):
-            logger.info(
-                f"Cached transform does not match input scene transform. Clearing the cache and regenerating transform."
-            )
-            output_cache.clear_current_folder()
-            regenerate_cache = True
+        else:
+            transform_data = loaded_transform_data
+            cached_transform: np.ndarray | None = transform_data.get("transform", None)
+            if cached_transform is None:
+                logger.info("Transform metadata does not match expected format. No 'transform' key in cached file.")
+                output_cache.clear_current_folder()
+                regenerate_cache = True
+            elif not isinstance(cached_transform, np.ndarray) or cached_transform.shape != (4, 4):
+                logger.info(
+                    "Transform metadata does not match expected format. Expected 'transform'."
+                    "Clearing the cache and regenerating transform."
+                )
+                output_cache.clear_current_folder()
+                regenerate_cache = True
+            elif not np.allclose(cached_transform, input_scene.transformation_matrix):
+                logger.info(
+                    "Cached transform does not match input scene transform. "
+                    "Clearing the cache and regenerating transform."
+                )
+                output_cache.clear_current_folder()
+                regenerate_cache = True
     else:
         logger.info("No transform found in cache, regenerating.")
         output_cache.clear_current_folder()
         regenerate_cache = True
 
-    for image_id in range(len(masked_scene.images)):
+    for image_meta in masked_scene.images:
         if regenerate_cache:
             break
-        image_cache_filename = f"mask_{image_id:0{num_zeropad}}"
-        image_meta = masked_scene.images[image_id]
+        image_cache_filename = f"mask_{image_meta.image_id:0{num_zeropad}}"
         if not output_cache.has_file(image_cache_filename):
-            logger.info(f"Mask for image {image_id} not found in cache. Clearing cache and regenerating masks.")
+            logger.info(
+                f"Mask for image {image_meta.image_id} not found in cache. Clearing cache and regenerating masks."
+            )
             output_cache.clear_current_folder()
             regenerate_cache = True
             break
@@ -117,6 +242,8 @@ def _crop_scene_to_bbox(
             output_cache.clear_current_folder()
             regenerate_cache = True
             break
+        mask_path = str(key_meta["path"])
+        cached_mask_paths.append(mask_path)
         new_image_metadata.append(
             SfmPosedImageMetadata(
                 world_to_camera_matrix=image_meta.world_to_camera_matrix,
@@ -125,15 +252,30 @@ def _crop_scene_to_bbox(
                 camera_id=image_meta.camera_id,
                 image_id=image_meta.image_id,
                 image_path=image_meta.image_path,
-                mask_path=str(key_meta["path"]),
+                mask_path=mask_path,
                 point_indices=image_meta.point_indices,
             )
         )
 
+    mask_bboxes = None
+    if not regenerate_cache:
+        mask_bboxes = _get_cached_mask_bboxes(transform_data, image_ids)
+        if mask_bboxes is None:
+            logger.info("Upgrading cached crop masks with per-image bounding-box metadata.")
+            mask_bboxes = np.asarray(
+                [_mask_bbox_xyxy_count(_read_mask(mask_path)) for mask_path in cached_mask_paths], dtype=np.int64
+            ).reshape((-1, 5))
+            _write_transform_manifest(
+                output_cache,
+                input_scene.transformation_matrix,
+                image_ids,
+                mask_bboxes,
+            )
+
     if regenerate_cache:
-        output_cache.write_file("transform", {"transform": input_scene.transformation_matrix}, data_type="pt")
-        logger.info(f"Computing image masks for cropping and saving to cache.")
+        logger.info("Computing image masks for cropping and saving to cache.")
         new_image_metadata = []
+        mask_bbox_rows: list[np.ndarray] = []
 
         min_x, min_y, min_z, max_x, max_y, max_z = bbox
 
@@ -165,46 +307,16 @@ def _crop_scene_to_bbox(
             # Divide out the homogeneous coordinate and transpose -> [8, 2]
             cube_bounds_pixel_space = (cube_bounds_pixel_space[:2, :] / cube_bounds_pixel_space[2, :]).T
 
-            # Compute the pixel-space convex hull of the cube corners
+            # Compute and rasterize the pixel-space convex hull of the cube corners.
             convex_hull = ConvexHull(cube_bounds_pixel_space)
-            # Each face of the convex hull is defined by a normal vector and an offset
-            # These define a set of half spaces. We're going to check that we're on the inside of all of them
-            # to determine if a pixel is inside the convex hull
-            hull_normals = convex_hull.equations[:, :-1]  # [num_faces, 2]
-            hull_offsets = convex_hull.equations[:, -1]  # [n_faces]
-
-            # Generate a grid of pixel (u, v) coordinates of shape [image_height, image_width, 2]
             image_width = image_meta.camera_metadata.width
             image_height = image_meta.camera_metadata.height
-            pixel_u, pixel_v = np.meshgrid(np.arange(image_width), np.arange(image_height), indexing="xy")
-            pixel_coords = np.stack([pixel_u, pixel_v], axis=-1)  # [image_height, image_width, 2]
-
-            # Shift and take the dot product between each pixel coordinate and the hull half-space normals
-            # to get the shortest signed distance to each face of the convex hull
-            # This produces an (image_height, image_width, num_faces)-shaped array
-            # where each pixel has a signed distance to each face of the convex hull
-            pixel_to_half_space_signed_distances = (
-                pixel_coords @ hull_normals.T + hull_offsets[np.newaxis, np.newaxis, :]
-            )
-
-            # A pixel lies inside the hull if it's signed distance to all faces is less than or equal to zero
-            # This produces a boolean mask of shape [image_height, image_width]
-            # where True indicates the pixel is inside the hull
-            inside_mask = np.all(pixel_to_half_space_signed_distances <= 0.0, axis=-1)  # [image_height, image_width]
+            inside_mask = _rasterize_convex_hull_mask(convex_hull, image_height, image_width)
 
             # If the mask already exists, load it and composite this one into it
             mask_to_save = inside_mask.astype(np.uint8) * 255  # Convert to uint8 mask
             if os.path.exists(image_meta.mask_path) and composite_with_existing_masks:
-                if image_meta.mask_path.strip().endswith(".npy"):
-                    existing_mask = np.load(image_meta.mask_path)
-                elif image_meta.mask_path.strip().endswith(".png"):
-                    existing_mask = cv2.imread(image_meta.mask_path, cv2.IMREAD_GRAYSCALE)
-                    assert existing_mask is not None, f"Failed to load mask {image_meta.mask_path}"
-                elif image_meta.mask_path.strip().endswith(".jpg"):
-                    existing_mask = cv2.imread(image_meta.mask_path, cv2.IMREAD_GRAYSCALE)
-                    assert existing_mask is not None, f"Failed to load mask {image_meta.mask_path}"
-                else:
-                    raise ValueError(f"Unsupported mask file format: {image_meta.mask_path}")
+                existing_mask = _read_mask(image_meta.mask_path)
                 if existing_mask.ndim == 3:
                     # Ensure the mask is 3D to match the input mask
                     inside_mask = inside_mask[..., np.newaxis]
@@ -222,6 +334,11 @@ def _crop_scene_to_bbox(
                 data=mask_to_save,
                 data_type=mask_format,
             )
+            if mask_format == "jpg":
+                # JPEG is lossy, so metadata must describe the mask that downstream code will decode.
+                mask_bbox_rows.append(_mask_bbox_xyxy_count(_read_mask(str(cache_file_meta["path"]))))
+            else:
+                mask_bbox_rows.append(_mask_bbox_xyxy_count(mask_to_save))
 
             new_image_metadata.append(
                 SfmPosedImageMetadata(
@@ -236,6 +353,14 @@ def _crop_scene_to_bbox(
                 )
             )
 
+        mask_bboxes = np.asarray(mask_bbox_rows, dtype=np.int64).reshape((-1, 5))
+        _write_transform_manifest(
+            output_cache,
+            input_scene.transformation_matrix,
+            image_ids,
+            mask_bboxes,
+        )
+
     new_attrs = {}
     for attr_name, attr in masked_scene.attributes.items():
         new_attrs[attr_name] = attr.on_crop_scene(
@@ -243,6 +368,12 @@ def _crop_scene_to_bbox(
             bbox=bbox,
             output_cache=output_cache,
         )
+
+    if mask_bboxes is None:
+        raise RuntimeError("Crop mask bounding-box metadata was not initialized")
+    new_attrs[CROP_MASK_BBOX_ATTRIBUTE] = PerImageValueAttribute(
+        [bbox_row.copy() for bbox_row in mask_bboxes]
+    )
 
     output_scene = masked_scene.replace(
         images=new_image_metadata,

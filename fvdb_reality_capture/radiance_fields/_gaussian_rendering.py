@@ -107,6 +107,7 @@ class RenderBackend(Protocol):
         image_height: int,
         sh_degree_to_use: int,
         crop: tuple[int, int, int, int],
+        raster_tile_mask: torch.Tensor | None = None,
     ) -> RenderOutputs:
         """
         Render a training crop and return the tensors needed for loss computation.
@@ -122,6 +123,7 @@ class RenderBackend(Protocol):
             image_height (int): Full image height in pixels before cropping.
             sh_degree_to_use (int): Maximum spherical harmonics degree to render.
             crop (tuple[int, int, int, int]): Crop rectangle as ``(origin_w, origin_h, width, height)``.
+            raster_tile_mask (torch.Tensor | None): Optional compact boolean raster tile mask.
 
         Returns:
             RenderOutputs: The rendered training crop, alpha image, and optional depth image.
@@ -201,6 +203,7 @@ class ImageSpaceRenderBackend:
         image_height: int,
         sh_degree_to_use: int,
         crop: tuple[int, int, int, int],
+        raster_tile_mask: torch.Tensor | None = None,
     ) -> RenderOutputs:
         """
         Render a cropped training view using image-space projection and rasterization.
@@ -255,6 +258,7 @@ class ImageSpaceRenderBackend:
             crop_origin_w=crop_origin_w,
             crop_origin_h=crop_origin_h,
             tile_size=config.tile_size,
+            tile_masks=raster_tile_mask,
         )
         image = rendered[..., : model.num_channels]
         depth = rendered[..., -1:] if rendered.shape[-1] == model.num_channels + 1 else None
@@ -349,11 +353,16 @@ class ImageSpaceRenderBackend:
                 world_to_camera = world_to_camera.contiguous()
                 projection = projection.contiguous()
                 distortion_coeffs = distortion_coeffs.contiguous()
-                height, width = datum["image"].shape[:2]
+                if "full_image_size" in datum:
+                    full_image_size = datum["full_image_size"]
+                    height = int(full_image_size[0].item())
+                    width = int(full_image_size[1].item())
+                else:
+                    height, width = datum["image"].shape[:2]
                 camera_model_enum = CameraModel(camera_model)
                 distortion_coeffs_arg = _distortion_coeffs_for_batch(camera_model_enum, distortion_coeffs, model.device)
                 if render_depth:
-                    model.project_gaussians_for_images_and_depths(
+                    projected_gaussians = model.project_gaussians_for_images_and_depths(
                         world_to_camera_matrices=world_to_camera,
                         projection_matrices=projection,
                         image_width=width,
@@ -369,7 +378,7 @@ class ImageSpaceRenderBackend:
                         antialias=config.antialias,
                     )
                 else:
-                    model.project_gaussians_for_images(
+                    projected_gaussians = model.project_gaussians_for_images(
                         world_to_camera_matrices=world_to_camera,
                         projection_matrices=projection,
                         image_width=width,
@@ -383,6 +392,34 @@ class ImageSpaceRenderBackend:
                         min_radius_2d=config.min_radius_2d,
                         eps_2d=config.eps_2d,
                         antialias=config.antialias,
+                    )
+
+                if config.mask_rasterization_mode != "off":
+                    crop_x, crop_y, crop_width, crop_height = (
+                        int(value) for value in datum["raster_crop"]
+                    )
+                    probe_width = min(config.tile_size, crop_width)
+                    probe_height = min(config.tile_size, crop_height)
+                    # Exercise the translated-mean path when the selected crop has room for a nonzero origin.
+                    if crop_x == 0 and crop_width > probe_width:
+                        crop_x = 1
+                    if crop_y == 0 and crop_height > probe_height:
+                        crop_y = 1
+
+                    probe_tile_mask = None
+                    if config.mask_rasterization_mode == "tiles":
+                        probe_tile_mask = torch.as_tensor(
+                            datum["raster_tile_mask"][:1, :1],
+                            dtype=torch.bool,
+                        ).unsqueeze(0).to(device)
+                    model.render_from_projected_gaussians(
+                        projected_gaussians,
+                        crop_width=probe_width,
+                        crop_height=probe_height,
+                        crop_origin_w=crop_x,
+                        crop_origin_h=crop_y,
+                        tile_size=config.tile_size,
+                        tile_masks=probe_tile_mask,
                     )
 
 
@@ -467,6 +504,7 @@ class WorldSpaceRenderBackend:
         image_height: int,
         sh_degree_to_use: int,
         crop: tuple[int, int, int, int],
+        raster_tile_mask: torch.Tensor | None = None,
     ) -> RenderOutputs:
         """
         Render a cropped training view directly from world-space Gaussians.
@@ -490,6 +528,9 @@ class WorldSpaceRenderBackend:
         Returns:
             RenderOutputs: The rendered crop, alpha image, and optional depth image.
         """
+        if raster_tile_mask is not None:
+            raise NotImplementedError("Tile-masked rasterization is not supported by the world-space backend.")
+
         camera_model = _camera_model_from_batch(camera_models)
         distortion_coeffs_arg = _distortion_coeffs_for_batch(camera_model, distortion_coeffs, model.device)
         render_function = (

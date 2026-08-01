@@ -2396,6 +2396,7 @@ class GaussianSplat3d:
         tile_size: int = 16,
         backgrounds: torch.Tensor | None = None,
         masks: torch.Tensor | None = None,
+        tile_masks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Render a set of images from Gaussian splats that have already been projected onto image planes
@@ -2468,6 +2469,11 @@ class GaussianSplat3d:
             masks (torch.Tensor | None): Optional per-pixel boolean mask of shape ``(C, cropH, cropW)``
                 (in crop coordinate space, matching the output dimensions).
                 ``True`` means render, ``False`` means skip (filled with background).
+            tile_masks (torch.Tensor | None): Optional compact per-tile boolean mask of shape
+                ``(C, ceil(cropH / tile_size), ceil(cropW / tile_size))`` in output coordinate space.
+                ``True`` means render the tile and ``False`` means skip it (filled with background).
+                This is mutually exclusive with ``masks`` and is passed directly to the rasterizer without
+                constructing or applying a per-pixel mask.
 
 
         Returns:
@@ -2490,13 +2496,33 @@ class GaussianSplat3d:
         origin_w = crop_origin_w if crop_origin_w >= 0 else 0
         origin_h = crop_origin_h if crop_origin_h >= 0 else 0
 
-        tile_masks = _pixel_mask_to_tile_mask(masks, tile_size) if masks is not None else None
+        if masks is not None and tile_masks is not None:
+            raise ValueError("masks and tile_masks are mutually exclusive")
+
+        num_tiles_h = math.ceil(raster_h / tile_size)
+        num_tiles_w = math.ceil(raster_w / tile_size)
+        if tile_masks is not None:
+            if tile_masks.dtype != torch.bool:
+                raise TypeError(f"tile_masks must have dtype torch.bool, got {tile_masks.dtype}")
+            expected_tile_mask_shape = (C, num_tiles_h, num_tiles_w)
+            if tuple(tile_masks.shape) != expected_tile_mask_shape:
+                raise ValueError(
+                    f"tile_masks must have shape {expected_tile_mask_shape}, got {tuple(tile_masks.shape)}"
+                )
+
+        raster_tile_masks = _pixel_mask_to_tile_mask(masks, tile_size) if masks is not None else tile_masks
 
         if is_crop:
-            num_tiles_h = math.ceil(raster_h / tile_size)
-            num_tiles_w = math.ceil(raster_w / tile_size)
+            # Tile intersection and rasterization both operate in the raster's local coordinate system. Projected
+            # means are expressed in full-image coordinates, so translate them for nonzero-origin crops. Keep the
+            # original tensor for zero-origin crops to avoid an unnecessary allocation in the full-frame training path.
+            raster_means2d = pg.means2d
+            if origin_w != 0 or origin_h != 0:
+                crop_origin = pg.means2d.new_tensor((origin_w, origin_h))
+                raster_means2d = pg.means2d - crop_origin
+
             tile_offsets, tile_gaussian_ids = _C.intersect_gaussian_tiles(
-                pg.means2d,
+                raster_means2d,
                 pg.radii,
                 pg.depths,
                 C,
@@ -2507,20 +2533,20 @@ class GaussianSplat3d:
             features, alphas = cast(
                 tuple[torch.Tensor, torch.Tensor],
                 _RasterizeScreenSpaceGaussiansFn.apply(
-                    pg.means2d,
+                    raster_means2d,
                     pg.inv_covar_2d,
                     pg.render_quantities,
                     pg.opacities,
                     raster_w,
                     raster_h,
-                    origin_w,
-                    origin_h,
+                    0,
+                    0,
                     tile_size,
                     tile_offsets,
                     tile_gaussian_ids,
                     False,
                     backgrounds,
-                    tile_masks,
+                    raster_tile_masks,
                 ),
             )
         else:
@@ -2544,7 +2570,7 @@ class GaussianSplat3d:
                 tile_offsets,
                 tile_gaussian_ids,
                 backgrounds,
-                tile_masks,
+                raster_tile_masks,
             )
 
         if masks is not None:

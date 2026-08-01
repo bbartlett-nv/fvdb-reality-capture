@@ -32,12 +32,65 @@ from .gaussian_splat_dataset import SfmDataset
 from .gaussian_splatting import GaussianSplat3d
 from .gaussian_splat_optimizer import (
     BaseGaussianSplatOptimizer,
+    GaussianSplatOptimizer,
     GaussianSplatOptimizerConfig,
 )
 from .gaussian_splat_reconstruction_writer import (
     GaussianSplatReconstructionBaseWriter,
     GaussianSplatReconstructionWriter,
 )
+
+MASK_RASTERIZATION_CONTEXT_PIXELS = 10
+
+
+def _validate_mask_rasterization_config(
+    config: "GaussianSplatReconstructionConfig", num_channels: int | None = None
+) -> None:
+    """Reject combinations whose loss/raster semantics are not yet supported."""
+    mode = config.mask_rasterization_mode
+    if mode not in ("off", "tiles", "bbox"):
+        raise ValueError(f"Unknown mask_rasterization_mode {mode!r}; expected one of: off, tiles, bbox.")
+    if mode == "off":
+        return
+
+    if config.render_backend != "image_space":
+        raise ValueError("Mask-aware rasterization currently requires render_backend='image_space'.")
+    if config.batch_size != 1:
+        raise ValueError("Mask-aware rasterization currently requires batch_size=1.")
+    if config.crops_per_image != 1:
+        raise ValueError("Mask-aware rasterization currently requires crops_per_image=1.")
+    if config.ignore_masks:
+        raise ValueError("Mask-aware rasterization cannot be combined with ignore_masks=True.")
+    if config.sparse_depth_reg > 0.0 or config.dense_depth_reg > 0.0:
+        raise ValueError("Mask-aware rasterization currently supports RGB image losses only, without depth losses.")
+    if config.tile_size <= 0:
+        raise ValueError("Mask-aware rasterization requires tile_size > 0.")
+    if num_channels is not None and num_channels != 3:
+        raise ValueError(f"Mask-aware rasterization currently supports RGB models only; got {num_channels} channels.")
+
+
+def _masked_ground_truth(
+    ground_truth: torch.Tensor, prediction: torch.Tensor, valid_mask: torch.Tensor
+) -> torch.Tensor:
+    """Replace invalid ground-truth pixels with a detached prediction.
+
+    The fixed-shape ``torch.where`` avoids boolean advanced indexing, which is not
+    reliable on every PrivateUse1 backend (including Torch-DGX).
+    """
+    if ground_truth.shape != prediction.shape:
+        raise ValueError(
+            f"Ground truth and prediction must have the same shape; got {ground_truth.shape} and {prediction.shape}."
+        )
+    if valid_mask.shape != ground_truth.shape[:-1]:
+        raise ValueError(
+            f"Mask shape must match the non-channel image dimensions; got {valid_mask.shape} for "
+            f"image shape {ground_truth.shape}."
+        )
+
+    valid_rgb = (
+        valid_mask.to(device=ground_truth.device, dtype=torch.bool).unsqueeze(-1).expand_as(ground_truth).contiguous()
+    )
+    return torch.where(valid_rgb, ground_truth, prediction.detach())
 
 
 def _scale_shift_invariant_l1(
@@ -260,6 +313,25 @@ class GaussianSplatReconstructionConfig:
     Default: ``0.65``
     """
 
+    prune_after_refinement_stop: bool = False
+    """
+    If set to ``True``, continue deleting low-opacity and oversized Gaussians at the configured refinement cadence
+    after insertion and splitting stop. Pruning is independent of the maximum-Gaussian budget and also runs before
+    post-refinement checkpoints and the final export.
+
+    This option is supported by the classic :class:`GaussianSplatOptimizer` only.
+
+    Default: ``False``
+    """
+
+    freeze_scales_after_refinement_stop: bool = False
+    """
+    If set to ``True``, stop updating Gaussian scales once insertion and splitting stop. Other Gaussian parameters
+    continue to optimize normally, and post-refinement pruning can still remove oversized Gaussians.
+
+    Default: ``False``
+    """
+
     ignore_masks: bool = False
     """
     If set to ``True``, then ignore any masks in the data and treat all pixels as valid during optimization.
@@ -267,9 +339,25 @@ class GaussianSplatReconstructionConfig:
     Default: ``False``
     """
 
+    mask_rasterization_mode: Literal["off", "tiles", "bbox"] = "off"
+    """
+    Reduce rasterization work using training-image masks.
+
+    ``"bbox"`` decodes each image and transfers/rasterizes only a tile-aligned bounding box around its valid mask,
+    including the context required to preserve the existing 11-by-11 SSIM objective. ``"tiles"`` keeps full-size
+    images but skips raster tiles that cannot affect the masked loss. ``"off"`` preserves the existing behavior.
+
+    The optimized modes currently require image-space RGB rendering, batch size 1, one crop per image, masks enabled,
+    and no sparse or dense depth loss.
+
+    Default: ``"off"``
+    """
+
     remove_gaussians_outside_scene_bbox: bool = False
     """
-    If set to ``True``, then Gaussians that fall outside the scene bounding box will be removed during refinement.
+    If set to ``True``, then Gaussians whose means fall outside the scene bounding box will be removed at the
+    configured refinement cadence throughout optimization, including after refinement stops. Checkpoints saved after
+    refinement stops and the final export are clipped as well.
 
     Default: ``False``
     """
@@ -509,6 +597,7 @@ class GaussianSplatReconstruction:
         torch.manual_seed(config.seed)
 
         logger = logging.getLogger(f"{cls.__module__}.{cls.__name__}")
+        _validate_mask_rasterization_config(config)
 
         train_indices, val_indices = cls._make_index_splits(sfm_scene, use_every_n_as_val)
         train_dataset = SfmDataset(sfm_scene, train_indices)
@@ -529,7 +618,6 @@ class GaussianSplatReconstruction:
         logger.info(f"Model initialized with {model.num_gaussians:,} Gaussians")
 
         render_backend = make_render_backend(config.render_backend)
-        render_backend.validate_scene_cameras(model, train_dataset, config, torch.device(device))
 
         # Initialize optimizer
         max_steps = config.max_epochs * len(train_dataset)
@@ -791,6 +879,11 @@ class GaussianSplatReconstruction:
         self._viz_update_interval_epochs = viz_update_interval_epochs
         self._render_backend = render_backend
 
+        _validate_mask_rasterization_config(config, model.num_channels)
+        if config.prune_after_refinement_stop and not isinstance(optimizer, GaussianSplatOptimizer):
+            raise ValueError(
+                "prune_after_refinement_stop is supported only by the classic GaussianSplatOptimizer."
+            )
         self._sfm_scene = sfm_scene
 
         # Resolve dense-depth supervision: which attribute to load. The comparison form
@@ -828,6 +921,9 @@ class GaussianSplatReconstruction:
             dataset_indices=train_indices,
             return_visible_points=(self.config.sparse_depth_reg > 0.0),
             load_attributes=dense_depth_load,
+            mask_rasterization_mode=self.config.mask_rasterization_mode,
+            raster_tile_size=self.config.tile_size,
+            raster_context_pixels=MASK_RASTERIZATION_CONTEXT_PIXELS,
         )
         self._validation_dataset = SfmDataset(sfm_scene=sfm_scene, dataset_indices=val_indices)
 
@@ -1217,7 +1313,15 @@ class GaussianSplatReconstruction:
             outside_mask.logical_or_(points[:, 2] < bbox_min[2])
             outside_mask.logical_or_(points[:, 2] > bbox_max[2])
 
-        self.optimizer.filter_gaussians(~outside_mask)
+        num_outside = int(outside_mask.sum().item())
+        if num_outside == 0:
+            self._logger.debug(f"Clipped 0 Gaussians outside the crop bounding box min={bbox_min}, max={bbox_max}.")
+            return
+
+        keep_indices = torch.where(~outside_mask)[0]
+        # Use integer indices rather than a boolean advanced-indexing expression.
+        # This is supported by Torch-DGX and matches the indexing path used during refinement.
+        self.optimizer.filter_gaussians(keep_indices)
         num_gaussians_after_clipping = self.model.num_gaussians
         num_clipped_gaussians = num_gaussians_before_clipping - num_gaussians_after_clipping
         self._logger.debug(
@@ -1268,6 +1372,29 @@ class GaussianSplatReconstruction:
         pose_opt_start_step: int = int(self.config.pose_opt_start_epoch * num_steps_per_epoch)
         pose_opt_stop_step: int = int(self.config.pose_opt_stop_epoch * num_steps_per_epoch)
 
+        last_post_refinement_prune_step: int | None = None
+
+        def prune_after_refinement_stop() -> None:
+            """Prune at most once at a given global step."""
+            nonlocal last_post_refinement_prune_step
+            if last_post_refinement_prune_step == self._global_step:
+                return
+            assert isinstance(self.optimizer, GaussianSplatOptimizer)
+            self.optimizer.prune(use_scale_threshold=True)
+            last_post_refinement_prune_step = self._global_step
+
+        def prepare_post_refinement_step() -> None:
+            """Disable work that is needed only while insertion and splitting are active."""
+            if self._global_step < refine_stop_step:
+                return
+            self.model.accumulate_mean_2d_gradients = False
+            self.model.accumulate_max_2d_radii = False
+            if self.config.freeze_scales_after_refinement_stop:
+                # Disabling autograd before rendering avoids computing scale gradients. Filtering can replace
+                # parameter tensors and re-enable gradients, so this helper is also called before optimizer.step().
+                self.model.log_scales.grad = None
+                self.model.log_scales.requires_grad_(False)
+
         update_viz_every_step = int(self._viz_update_interval_epochs * num_steps_per_epoch)
 
         # Progress bar to track reconstruction progress
@@ -1314,6 +1441,7 @@ class GaussianSplatReconstruction:
 
         for epoch in range(start_epoch, self.config.max_epochs):
             for minibatch in trainloader:
+                prepare_post_refinement_step()
 
                 # Camera pose optimization
                 image_ids: torch.Tensor | None = None
@@ -1339,7 +1467,25 @@ class GaussianSplatReconstruction:
                 distortion_coeffs = minibatch["distortion_coeffs"]
                 image = minibatch["image"]  # [B, H, W, 3]
                 mask = minibatch["mask"] if "mask" in minibatch and not self.config.ignore_masks else None
-                image_height, image_width = image.shape[1:3]
+                mask_rasterization_mode = self.config.mask_rasterization_mode
+                raster_tile_mask = minibatch.get("raster_tile_mask")
+                if raster_tile_mask is not None:
+                    raster_tile_mask = raster_tile_mask.to(self.device, dtype=torch.bool)
+
+                if mask_rasterization_mode == "bbox":
+                    full_image_size = minibatch["full_image_size"][0]
+                    image_height = int(full_image_size[0].item())
+                    image_width = int(full_image_size[1].item())
+                    raster_crop = minibatch["raster_crop"][0]
+                    crop = tuple(int(value.item()) for value in raster_crop)
+                    training_crops = ((image, mask, crop, True),)
+                else:
+                    image_height, image_width = image.shape[1:3]
+                    training_crops = crop_image_batch(image, mask, self.config.crops_per_image)
+
+                image_loss_scale = 1.0
+                if "image_loss_scale" in minibatch:
+                    image_loss_scale = float(minibatch["image_loss_scale"].reshape(-1)[0].item())
                 sparse_depth = minibatch["sparse_depth"].to(self.device) if "sparse_depth" in minibatch else None
                 sparse_depth_uv = (
                     minibatch["sparse_depth_uv"].to(self.device, dtype=torch.int32)
@@ -1362,7 +1508,7 @@ class GaussianSplatReconstruction:
                 sh_degree_to_use = min(self._global_step // increase_sh_degree_every_step, self.config.sh_degree)
                 # If you have very large images, you can iterate over disjoint crops and accumulate gradients
                 # If self.optimization_config.crops_per_image is 1, then this just returns the image
-                for pixels, mask_pixels, crop, is_last in crop_image_batch(image, mask, self.config.crops_per_image):
+                for pixels, mask_pixels, crop, is_last in training_crops:
                     # Actual pixels to compute the loss on, normalized to [0, 1]
                     pixels: torch.Tensor = pixels.to(device=self.device) / 255.0  # [1, H, W, 3]
 
@@ -1379,6 +1525,7 @@ class GaussianSplatReconstruction:
                         image_height=image_height,
                         sh_degree_to_use=sh_degree_to_use,
                         crop=crop,
+                        raster_tile_mask=raster_tile_mask,
                     )
                     image = render_outputs.image
 
@@ -1388,9 +1535,8 @@ class GaussianSplatReconstruction:
                         image = image + bkgd * (1.0 - render_outputs.alpha)
 
                     if mask_pixels is not None:
-                        # set the ground truth pixel values to match render, thus loss is zero at mask pixels and not updated
-                        mask_pixels = mask_pixels.to(self.device)
-                        pixels[~mask_pixels] = image.detach()[~mask_pixels]
+                        # Match invalid ground-truth pixels to the detached render before computing image losses.
+                        pixels = _masked_ground_truth(pixels, image, mask_pixels)
 
                     # Image losses
                     l1loss = nnf.l1_loss(image, pixels)
@@ -1398,6 +1544,8 @@ class GaussianSplatReconstruction:
                         image.permute(0, 3, 1, 2).contiguous(),
                         pixels.permute(0, 3, 1, 2).contiguous(),
                     )
+                    l1loss = l1loss * image_loss_scale
+                    ssimloss = ssimloss * image_loss_scale
                     loss = torch.lerp(l1loss, ssimloss, self.config.ssim_lambda)  # type: ignore
 
                     # Apply any additional regularization to the model for the given
@@ -1472,19 +1620,24 @@ class GaussianSplatReconstruction:
                     # for every crop but the last one
                     loss.backward(retain_graph=not is_last)
 
-                # Refine the gaussians via splitting/duplication/pruning
-                if (
-                    self._global_step > refine_start_step
-                    and self._global_step % refine_every_step == 0
-                    and self._global_step < refine_stop_step
+                # Refine before the stop step and enforce bbox clipping on the same cadence throughout training.
+                is_refinement_cadence_step = self._global_step % refine_every_step == 0
+                is_after_refinement_start = self._global_step > refine_start_step
+                if is_refinement_cadence_step and (
+                    is_after_refinement_start or self._global_step >= refine_stop_step
                 ):
-                    self.optimizer.refine()
+                    if is_after_refinement_start and self._global_step < refine_stop_step:
+                        self.optimizer.refine()
+                    elif self.config.prune_after_refinement_stop:
+                        prune_after_refinement_stop()
 
-                    # If you specified a crop bounding box, clip the Gaussians that are outside the crop
-                    # bounding box. This is useful if you want to reconstruct on a subset of the scene
-                    # and don't want to waste resources on Gaussians that are outside the crop.
+                    # Keep enforcing the crop at the same cadence after densification stops so drifting
+                    # Gaussians do not consume resources for the remainder of optimization.
                     if self.config.remove_gaussians_outside_scene_bbox:
                         self._clip_gaussians_to_scene_bbox()
+
+                # Filtering replaces parameter tensors and re-enables gradients, so restore the post-stop state.
+                prepare_post_refinement_step()
 
                 # Step the Gaussian optimizer
                 self.optimizer.step()
@@ -1572,6 +1725,11 @@ class GaussianSplatReconstruction:
                         f"Skipping checkpoint save at epoch {epoch + 1} (before start step {self._start_step})."
                     )
                     continue
+                if self.config.prune_after_refinement_stop and self._global_step >= refine_stop_step:
+                    prune_after_refinement_stop()
+                if self.config.remove_gaussians_outside_scene_bbox and self._global_step >= refine_stop_step:
+                    self._clip_gaussians_to_scene_bbox()
+                prepare_post_refinement_step()
                 self._logger.info(f"Saving checkpoint at global step {self._global_step}.")
                 self._writer.save_checkpoint(self._global_step, f"{log_tag}_ckpt.pt", self.state_dict())
                 self._writer.save_ply(
@@ -1588,6 +1746,14 @@ class GaussianSplatReconstruction:
                     )
                     continue
                 self.eval(log_tag=log_tag + "_eval")
+
+        # Means continue to optimize after refinement stops and can drift outside the scene
+        # bounding box. Enforce the crop once more before the caller performs its final export.
+        if self.config.prune_after_refinement_stop and self._global_step >= refine_stop_step:
+            prune_after_refinement_stop()
+        if self.config.remove_gaussians_outside_scene_bbox:
+            self._clip_gaussians_to_scene_bbox()
+        prepare_post_refinement_step()
 
         self._logger.info("Training completed.")
 
@@ -1651,9 +1817,8 @@ class GaussianSplatReconstruction:
             evaluation_time += time.time() - tic
 
             if mask_pixels is not None:
-                # set the ground truth pixel values to match render, thus loss is zero at mask pixels and not updated
-                mask_pixels = mask_pixels.to(self.device)
-                ground_truth_image[~mask_pixels] = predicted_image.detach()[~mask_pixels]
+                # Match invalid ground-truth pixels to the detached render before computing metrics.
+                ground_truth_image = _masked_ground_truth(ground_truth_image, predicted_image, mask_pixels)
 
             # Save images
             self._writer.save_image(self._global_step, f"{log_tag}/predicted_image{i:04d}.jpg", predicted_image)

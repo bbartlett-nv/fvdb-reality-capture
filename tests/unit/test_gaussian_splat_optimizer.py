@@ -4,6 +4,7 @@
 
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -262,6 +263,90 @@ class GaussianSplatOptimizerRefinementTests(GettysburgGaussianSplatTestCase, uni
         self.assertEqual(num_split, 0)
         self.assertEqual(num_deleted, expected_num_deletions)
         self.assertEqual(model.num_gaussians, initial_num_gaussians + num_duplicated + num_split - num_deleted)
+
+    def test_prune_deletes_opacity_and_scale_without_insertion_or_budget_gate(self):
+        model = self.model
+        optimizer = self.optimizer
+        self._setup_no_refinement()
+
+        initial_num_gaussians = model.num_gaussians
+        num_in_group = max(1, initial_num_gaussians // 20)
+        permutation = torch.randperm(initial_num_gaussians, device=model.device)
+        insertion_indices = permutation[:num_in_group]
+        opacity_indices = permutation[num_in_group : 2 * num_in_group]
+        scale_indices = permutation[2 * num_in_group : 3 * num_in_group]
+
+        # These candidates would grow the model during full refinement, but prune-only must ignore them.
+        self._setup_gaussians_for_insertion(insertion_indices)
+        expected_num_deleted = self._setup_gaussians_for_deletion(opacity_indices, scale_indices)
+
+        delete_mask = torch.zeros(initial_num_gaussians, dtype=torch.bool, device=model.device)
+        delete_mask[opacity_indices] = True
+        delete_mask[scale_indices] = True
+        expected_keep_indices = torch.where(~delete_mask)[0]
+
+        sh0_before = model.sh0.detach().clone()
+        assert model.sh0.grad is not None
+        sh0_grad_before = model.sh0.grad.detach().clone()
+        sh0_state_before = {
+            key: value.detach().clone()
+            for key, value in optimizer._optimizer.state[model.sh0].items()
+            if key != "step"
+        }
+        refine_count_before = optimizer._refine_count
+
+        # Full refine() would skip everything at this cap; prune-only deletion must still run.
+        optimizer._config.max_gaussians = 1
+        optimizer._config.use_scales_for_deletion_after_n_refinements = 100_000
+        with patch.object(optimizer, "filter_gaussians", wraps=optimizer.filter_gaussians) as filter_gaussians:
+            prune_stats = optimizer.prune(use_scale_threshold=True)
+
+        self.assertEqual(prune_stats, {"num_deleted": expected_num_deleted})
+        self.assertEqual(model.num_gaussians, initial_num_gaussians - expected_num_deleted)
+        self.assertEqual(optimizer._refine_count, refine_count_before)
+
+        filter_gaussians.assert_called_once()
+        keep_indices = filter_gaussians.call_args.args[0]
+        self.assertEqual(keep_indices.dtype, torch.long)
+        self.assertEqual(keep_indices.device, model.device)
+        torch.testing.assert_close(keep_indices, expected_keep_indices)
+
+        # Filtering preserves current gradients and Adam moments for every surviving Gaussian.
+        torch.testing.assert_close(model.sh0, sh0_before[expected_keep_indices])
+        assert model.sh0.grad is not None
+        torch.testing.assert_close(model.sh0.grad, sh0_grad_before[expected_keep_indices])
+        sh0_state_after = optimizer._optimizer.state[model.sh0]
+        for key, value in sh0_state_before.items():
+            torch.testing.assert_close(sh0_state_after[key], value[expected_keep_indices])
+
+    def test_prune_can_disable_scale_deletion(self):
+        model = self.model
+        optimizer = self.optimizer
+        self._setup_no_refinement()
+
+        initial_num_gaussians = model.num_gaussians
+        indices = torch.randperm(initial_num_gaussians, device=model.device)[:2]
+        opacity_indices = indices[:1]
+        scale_indices = indices[1:]
+        self._setup_gaussians_for_deletion(opacity_indices, scale_indices)
+
+        prune_stats = optimizer.prune(use_scale_threshold=False)
+
+        self.assertEqual(prune_stats, {"num_deleted": 1})
+        self.assertEqual(model.num_gaussians, initial_num_gaussians - 1)
+
+    def test_prune_no_op_does_not_replace_model_parameters(self):
+        model = self.model
+        optimizer = self.optimizer
+        self._setup_no_refinement()
+        sh0_before = model.sh0
+
+        with patch.object(optimizer, "filter_gaussians", wraps=optimizer.filter_gaussians) as filter_gaussians:
+            prune_stats = optimizer.prune(use_scale_threshold=True)
+
+        self.assertEqual(prune_stats, {"num_deleted": 0})
+        filter_gaussians.assert_not_called()
+        self.assertIs(model.sh0, sh0_before)
 
     def test_refinement_insertion_and_deletion_overlap_with_scales(self):
         model = self.model

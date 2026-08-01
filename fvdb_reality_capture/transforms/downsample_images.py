@@ -10,6 +10,7 @@ import cv2
 import tqdm
 
 from fvdb_reality_capture.sfm_scene import SfmCache, SfmPosedImageMetadata, SfmScene
+from fvdb_reality_capture.sfm_scene.scene_attribute import CROP_MASK_BBOX_ATTRIBUTE
 
 from .base_transform import BaseTransform, transform
 
@@ -296,6 +297,10 @@ class DownsampleImages(BaseTransform):
 
         new_attrs = {}
         for attr_name, attr in input_scene.attributes.items():
+            if attr_name == CROP_MASK_BBOX_ATTRIBUTE:
+                # These private bounds are in the input image coordinate system. Omit them so consumers
+                # recompute bounds from the resized output masks instead of using stale full-resolution values.
+                continue
             new_attrs[attr_name] = attr.on_downsample_images(
                 attr_name=attr_name,
                 downsample_factor=self._image_downsample_factor,

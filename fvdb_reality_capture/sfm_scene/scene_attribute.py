@@ -11,6 +11,10 @@ import numpy as np
 
 REGISTERED_SCENE_ATTRIBUTES: dict[str, type["SceneAttribute"]] = {}
 
+# Internal per-image attribute populated by CropScene. Each value is
+# ``[x_min, y_min, x_max, y_max, valid_pixel_count]`` in full-image coordinates.
+CROP_MASK_BBOX_ATTRIBUTE = "_frgs_crop_mask_bbox_xyxy_count"
+
 DerivedAttribute = TypeVar("DerivedAttribute", bound=type)
 
 
