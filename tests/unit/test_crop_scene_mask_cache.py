@@ -26,6 +26,7 @@ from fvdb_reality_capture.transforms.crop_scene import (
     _MASK_BBOX_IMAGE_IDS_KEY,
     _MASK_BBOX_MANIFEST_VERSION_KEY,
     _mask_bbox_xyxy_count,
+    _points_in_bbox_mask,
     _project_bbox_mask,
     _rasterize_convex_hull_mask,
 )
@@ -129,6 +130,38 @@ class CropSceneMaskCacheTests(unittest.TestCase):
         byte_mask[0, 0] = 127
         byte_mask[4, 5] = 128
         np.testing.assert_array_equal(_mask_bbox_xyxy_count(byte_mask), np.array([5, 4, 6, 5, 1], dtype=np.int64))
+
+    def test_point_bbox_mask_uses_strict_bounds_across_blocks(self):
+        bbox = np.array([-1.0, -2.0, -3.0, 4.0, 5.0, 6.0], dtype=np.float32)
+        points = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+                [0.0, -2.0, 0.0],
+                [0.0, 5.0, 0.0],
+                [0.0, 0.0, -3.0],
+                [0.0, 0.0, 6.0],
+                [3.999, 4.999, 5.999],
+                [-1.001, 0.0, 0.0],
+                [np.nan, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        expected = np.logical_and.reduce(
+            [
+                points[:, 0] > bbox[0],
+                points[:, 0] < bbox[3],
+                points[:, 1] > bbox[1],
+                points[:, 1] < bbox[4],
+                points[:, 2] > bbox[2],
+                points[:, 2] < bbox[5],
+            ]
+        )
+
+        actual = _points_in_bbox_mask(points, bbox, block_size=2)
+
+        np.testing.assert_array_equal(actual, expected)
 
     def test_bounded_rasterizer_preserves_closed_half_space_semantics(self):
         hull = ConvexHull(

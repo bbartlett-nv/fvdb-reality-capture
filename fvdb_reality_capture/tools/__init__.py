@@ -12,6 +12,13 @@ from ._filter_splats import (
 )
 from ._mesh_from_splats import mesh_from_splats
 from ._mesh_from_splats_dlnr import mesh_from_splats_dlnr
+from ._merge_gaussian_ply import (
+    GaussianPlyMergeResult,
+    GaussianPlyMergeSource,
+    gaussian_center_ownership_mask,
+    merge_gaussian_ply_files,
+    validate_gaussian_ply_file,
+)
 from ._point_cloud_from_splats import point_cloud_from_splats
 from ._tsdf_from_splats import tsdf_from_splats
 from ._tsdf_from_splats_dlnr import tsdf_from_splats_dlnr
@@ -28,4 +35,9 @@ __all__ = [
     "filter_splats_above_scale",
     "filter_splats_below_scale",
     "export_splats_to_usd",
+    "GaussianPlyMergeResult",
+    "GaussianPlyMergeSource",
+    "gaussian_center_ownership_mask",
+    "merge_gaussian_ply_files",
+    "validate_gaussian_ply_file",
 ]

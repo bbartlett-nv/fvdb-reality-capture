@@ -630,11 +630,6 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
 
         candidate_indices = torch.where(is_duplicated | is_split)[0]
         candidate_priorities = insertion_priorities[candidate_indices]
-        candidate_costs = torch.where(
-            is_duplicated[candidate_indices],
-            torch.full_like(candidate_indices, duplication_cost),
-            torch.full_like(candidate_indices, split_cost),
-        )
 
         if available_growth == 0:
             selected_positions = torch.empty(0, dtype=torch.long, device=candidate_indices.device)
@@ -666,20 +661,39 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
                 nan=-np.inf,
                 neginf=-np.inf,
             )
-            costs_numpy = candidate_costs.detach().cpu().numpy()
+            candidate_indices_numpy = candidate_indices.detach().cpu().numpy()
+            duplicated_numpy = is_duplicated.detach().cpu().numpy()
+            costs_numpy = np.where(
+                duplicated_numpy[candidate_indices_numpy],
+                duplication_cost,
+                split_cost,
+            )
             priority_order = np.argsort(priorities_numpy, kind="stable")[::-1]
             selected_numpy = priority_order[np.cumsum(costs_numpy[priority_order]) <= available_growth]
             selected_positions = torch.as_tensor(
                 selected_numpy.copy(), dtype=torch.long, device=candidate_indices.device
             )
         else:
+            candidate_costs = torch.where(
+                is_duplicated[candidate_indices],
+                torch.full_like(candidate_indices, duplication_cost),
+                torch.full_like(candidate_indices, split_cost),
+            )
             finite_priorities = torch.nan_to_num(candidate_priorities, nan=-math.inf, neginf=-math.inf, posinf=math.inf)
             priority_order = torch.argsort(finite_priorities, descending=True, stable=True)
             cumulative_cost = torch.cumsum(candidate_costs[priority_order], dim=0)
             selected_positions = priority_order[cumulative_cost <= available_growth]
 
-        selected_mask = torch.zeros_like(is_duplicated)
-        selected_mask[candidate_indices[selected_positions]] = True
+        if candidate_indices.device.type == "dgx":
+            candidate_indices_numpy = candidate_indices.detach().cpu().numpy()
+            selected_positions_numpy = selected_positions.detach().cpu().numpy()
+            selected_mask_numpy = np.zeros(is_duplicated.shape, dtype=np.bool_)
+            selected_mask_numpy[candidate_indices_numpy[selected_positions_numpy]] = True
+            selected_mask = torch.as_tensor(selected_mask_numpy, dtype=torch.bool, device=is_duplicated.device)
+        else:
+            selected_mask = torch.zeros_like(is_duplicated)
+            selected_mask[candidate_indices[selected_positions]] = True
+
         is_duplicated.logical_and_(selected_mask)
         is_split.logical_and_(selected_mask)
 

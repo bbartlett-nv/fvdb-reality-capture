@@ -400,34 +400,47 @@ class SfmScene:
         Returns:
             SfmScene: A new :class:`SfmScene` instance with filtered points and corresponding metadata.
         """
-        visible_point_indices = set(np.argwhere(mask).ravel().tolist())
-        remap_indices = np.cumsum(mask, dtype=int)
-        filtered_images = []
-        image_meta: SfmPosedImageMetadata
-        for image_meta in self._images:
-            new_point_indices = None
-            if image_meta.point_indices is not None:
-                old_visible_points = set(image_meta.point_indices.tolist())
-                old_visible_points_filtered = old_visible_points.intersection(visible_point_indices)
-                new_point_indices = remap_indices[np.array(list(old_visible_points_filtered), dtype=np.int64)] - 1
-            filtered_images.append(
-                SfmPosedImageMetadata(
-                    world_to_camera_matrix=image_meta.world_to_camera_matrix,
-                    camera_to_world_matrix=image_meta.camera_to_world_matrix,
-                    camera_metadata=image_meta.camera_metadata,
-                    camera_id=image_meta.camera_id,
-                    image_path=image_meta.image_path,
-                    mask_path=image_meta.mask_path,
-                    point_indices=new_point_indices,
-                    image_id=image_meta.image_id,
+        mask_array = np.asarray(mask)
+        if mask_array.shape != (len(self._points),):
+            raise ValueError(f"Point filter mask must have shape ({len(self._points)},), got {mask_array.shape}")
+        if mask_array.dtype != np.bool_:
+            raise TypeError(f"Point filter mask must have boolean dtype, got {mask_array.dtype}")
+
+        if bool(np.all(mask_array)):
+            return self
+
+        if not self._has_point_indices:
+            # Trackless dense models have no visibility indices to remap. Avoid Python sets and
+            # an additional O(N) remap array for the tens-of-millions-of-points initialization path.
+            filtered_images = self._images
+        else:
+            old_to_new = np.full((len(self._points),), -1, dtype=np.int64)
+            old_to_new[mask_array] = np.arange(np.count_nonzero(mask_array), dtype=np.int64)
+            filtered_images = []
+            image_meta: SfmPosedImageMetadata
+            for image_meta in self._images:
+                new_point_indices = None
+                if image_meta.point_indices is not None:
+                    remapped_indices = old_to_new[image_meta.point_indices]
+                    new_point_indices = remapped_indices[remapped_indices >= 0]
+                filtered_images.append(
+                    SfmPosedImageMetadata(
+                        world_to_camera_matrix=image_meta.world_to_camera_matrix,
+                        camera_to_world_matrix=image_meta.camera_to_world_matrix,
+                        camera_metadata=image_meta.camera_metadata,
+                        camera_id=image_meta.camera_id,
+                        image_path=image_meta.image_path,
+                        mask_path=image_meta.mask_path,
+                        point_indices=new_point_indices,
+                        image_id=image_meta.image_id,
+                    )
                 )
-            )
 
-        filtered_points = self._points[mask]
-        filtered_points_err = self._points_err[mask]
-        filtered_points_rgb = self._points_rgb[mask]
+        filtered_points = self._points[mask_array]
+        filtered_points_err = self._points_err[mask_array]
+        filtered_points_rgb = self._points_rgb[mask_array]
 
-        new_attrs = {name: attr.on_filter_points(mask) for name, attr in self._attributes.items()}
+        new_attrs = {name: attr.on_filter_points(mask_array) for name, attr in self._attributes.items()}
 
         return self.replace(
             images=filtered_images,
@@ -531,9 +544,9 @@ class SfmScene:
             # Compute the median distance from the SfmPoints seen by each camera to the position of the camera
             median_depth_per_camera = []
             for image_meta in self.images:
-                assert (
-                    image_meta.point_indices is not None
-                ), "SfmScene.has_visible_point_indices is True but image has no point indices"
+                assert image_meta.point_indices is not None, (
+                    "SfmScene.has_visible_point_indices is True but image has no point indices"
+                )
 
                 # Don't use cameras that don't see any points in the estimate
                 if len(image_meta.point_indices) == 0:

@@ -247,6 +247,10 @@ class NormalizeScene(BaseTransform):
         """
         self._logger.info(f"Normalizing SfmScene with normalization type: {self._normalization_type}")
 
+        if self._normalization_type == "none":
+            self._normalization_transform = np.eye(4, dtype=np.float32)
+            return input_scene
+
         normalization_transform = self._compute_normalization_transform(input_scene)
         if normalization_transform is None:
             self._logger.warning("Returning the input scene unchanged.")
@@ -285,7 +289,7 @@ class NormalizeScene(BaseTransform):
                 camera_to_world_matrices = np.linalg.inv(world_to_camera_matrices)
                 normalization_transform = _camera_similarity_normalization_transform(camera_to_world_matrices)
             elif self._normalization_type == "none":
-                normalization_transform = np.eye(4)
+                normalization_transform = np.eye(4, dtype=np.float32)
             else:
                 raise RuntimeError(f"Unknown normalization type {self._normalization_type}")
 

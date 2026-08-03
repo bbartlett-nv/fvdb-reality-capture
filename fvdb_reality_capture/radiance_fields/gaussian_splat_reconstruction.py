@@ -41,6 +41,7 @@ from .gaussian_splat_reconstruction_writer import (
 )
 
 MASK_RASTERIZATION_CONTEXT_PIXELS = 10
+_KNN_QUERY_BATCH_SIZE = 262_144
 
 
 def _validate_mask_rasterization_config(
@@ -1316,19 +1317,42 @@ class GaussianSplatReconstruction:
                             for the Gaussians.
         """
 
-        def _knn(x_np: np.ndarray, k: int = 4) -> torch.Tensor:
+        def _knn_rms_distance(x_np: np.ndarray, k: int = 4) -> torch.Tensor:
+            num_points = len(x_np)
+            if num_points == 0:
+                raise ValueError("Cannot initialize a Gaussian model from an empty point cloud")
+            if num_points == 1:
+                scene_bbox = np.asarray(training_dataset.scene_bbox, dtype=np.float64)
+                scene_diagonal = float(np.linalg.norm(scene_bbox[3:] - scene_bbox[:3]))
+                fallback = scene_diagonal * 1.0e-3 if np.isfinite(scene_diagonal) else 1.0e-3
+                return torch.full((1,), max(fallback, np.finfo(np.float32).eps), device=device)
+
+            query_k = min(k, num_points)
             kd_tree = cKDTree(x_np)  # type: ignore
-            distances, _ = kd_tree.query(x_np, k=k)
-            return torch.from_numpy(distances).to(device=device, dtype=torch.float32)
+            rms_distances = np.empty((num_points,), dtype=np.float32)
+            for query_start in range(0, num_points, _KNN_QUERY_BATCH_SIZE):
+                query_stop = min(query_start + _KNN_QUERY_BATCH_SIZE, num_points)
+                distances, _ = kd_tree.query(x_np[query_start:query_stop], k=query_k, workers=-1)
+                neighbor_distances = distances[:, 1:]
+                rms_distances[query_start:query_stop] = np.sqrt(np.mean(np.square(neighbor_distances), axis=1)).astype(
+                    np.float32
+                )
+            np.maximum(rms_distances, np.finfo(np.float32).eps, out=rms_distances)
+            return torch.from_numpy(rms_distances).to(device=device)
 
         def _rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
             C0 = 0.28209479177387814
             return (rgb - 0.5) / C0
 
         num_gaussians = training_dataset.points.shape[0]
+        if optimizer_config.max_gaussians > 0 and num_gaussians > optimizer_config.max_gaussians:
+            raise ValueError(
+                f"Initialization contains {num_gaussians:,} points, exceeding max_gaussians="
+                f"{optimizer_config.max_gaussians:,}. max_gaussians applies independently to each chunk; "
+                "increase nchunks or max_gaussians rather than silently discarding dense initialization points."
+            )
 
-        dist2_avg = (_knn(training_dataset.points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-        dist_avg = torch.sqrt(dist2_avg)
+        dist_avg = _knn_rms_distance(training_dataset.points, 4)
 
         log_scales = (
             torch.log(dist_avg * optimizer_config.initial_covariance_scale).unsqueeze(-1).repeat(1, 3)
@@ -1340,7 +1364,8 @@ class GaussianSplatReconstruction:
             torch.full((num_gaussians,), optimizer_config.initial_opacity, device=device)
         )  # [N,]
 
-        rgbs = torch.from_numpy(training_dataset.points_rgb / 255.0).to(device=device, dtype=torch.float32)  # [N, 3]
+        rgbs = torch.from_numpy(training_dataset.points_rgb).to(device=device, dtype=torch.float32)  # [N, 3]
+        rgbs.div_(255.0)
         sh_0 = _rgb_to_sh(rgbs).unsqueeze(1)  # [N, 1, 3]
 
         sh_n = torch.zeros((num_gaussians, (config.sh_degree + 1) ** 2 - 1, 3), device=device)  # [N, K-1, 3]
@@ -1793,12 +1818,12 @@ class GaussianSplatReconstruction:
                 # If you enabled pose optimization, step the pose optimizer if we performed a
                 # pose update this iteration
                 if self.config.optimize_camera_poses and pose_opt_start_step <= self._global_step < pose_opt_stop_step:
-                    assert (
-                        self.pose_adjust_optimizer is not None
-                    ), "Pose optimizer should be initialized if pose optimization is enabled."
-                    assert (
-                        self.pose_adjust_scheduler is not None
-                    ), "Pose scheduler should be initialized if pose optimization is enabled."
+                    assert self.pose_adjust_optimizer is not None, (
+                        "Pose optimizer should be initialized if pose optimization is enabled."
+                    )
+                    assert self.pose_adjust_scheduler is not None, (
+                        "Pose scheduler should be initialized if pose optimization is enabled."
+                    )
                     self.pose_adjust_optimizer.step()
                     self.pose_adjust_scheduler.step()
                     self.pose_adjust_optimizer.zero_grad(set_to_none=True)

@@ -3,6 +3,7 @@
 #
 
 import logging
+import time
 from typing import Literal
 
 import numpy as np
@@ -32,6 +33,7 @@ _MASK_BBOX_IMAGE_IDS_KEY = "crop_mask_bbox_image_ids"
 _MASK_CACHE_FINGERPRINT_KEY = "crop_mask_cache_fingerprint"
 _MASK_PROJECTION_ALGORITHM_VERSION = 2
 _MAX_RASTER_WORKSPACE_BYTES = 64 * 1024 * 1024
+_POINT_FILTER_BLOCK_SIZE = 1_000_000
 _PINHOLE_NEAR_PLANE = 1.0e-6
 _BBOX_EDGE_INDICES = (
     (0, 1),
@@ -47,6 +49,57 @@ _BBOX_EDGE_INDICES = (
     (5, 7),
     (6, 7),
 )
+
+
+def _points_in_bbox_mask(
+    points: np.ndarray,
+    bbox: np.ndarray,
+    *,
+    block_size: int = _POINT_FILTER_BLOCK_SIZE,
+    show_progress: bool = False,
+) -> np.ndarray:
+    """Return the strict-interior point mask using bounded temporary storage."""
+    points = np.asarray(points)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"points must have shape (N, 3), got {points.shape}")
+    if bbox.shape != (6,):
+        raise ValueError(f"bbox must have shape (6,), got {bbox.shape}")
+    if (
+        isinstance(block_size, bool)
+        or not isinstance(block_size, (int, np.integer))
+        or block_size <= 0
+    ):
+        raise ValueError(f"block_size must be a positive integer, got {block_size!r}")
+
+    num_points = len(points)
+    points_mask = np.empty((num_points,), dtype=np.bool_)
+    scratch = np.empty((min(num_points, int(block_size)),), dtype=np.bool_)
+    progress = tqdm.tqdm(
+        total=num_points,
+        unit="pts",
+        unit_scale=True,
+        desc="Selecting points inside crop bounds",
+        disable=not show_progress,
+    )
+    try:
+        for start in range(0, num_points, int(block_size)):
+            stop = min(start + int(block_size), num_points)
+            point_block = points[start:stop]
+            mask_block = points_mask[start:stop]
+            scratch_block = scratch[: stop - start]
+
+            np.greater(point_block[:, 0], bbox[0], out=mask_block)
+            for axis in range(3):
+                if axis > 0:
+                    np.greater(point_block[:, axis], bbox[axis], out=scratch_block)
+                    np.logical_and(mask_block, scratch_block, out=mask_block)
+                np.less(point_block[:, axis], bbox[axis + 3], out=scratch_block)
+                np.logical_and(mask_block, scratch_block, out=mask_block)
+            progress.update(stop - start)
+    finally:
+        progress.close()
+
+    return points_mask
 
 
 def _rasterize_convex_hull_mask(convex_hull: ConvexHull, image_height: int, image_width: int) -> np.ndarray:
@@ -225,26 +278,36 @@ def _crop_scene_to_bbox(
         description=f"Image masks ({mask_format}) for cropping to bounding box {bbox}",
     )
 
-    # Create a mask over all the points which are inside the bounding box
-    points_mask = np.logical_and.reduce(
-        [
-            input_scene.points[:, 0] > bbox[0],
-            input_scene.points[:, 0] < bbox[3],
-            input_scene.points[:, 1] > bbox[1],
-            input_scene.points[:, 1] < bbox[4],
-            input_scene.points[:, 2] > bbox[2],
-            input_scene.points[:, 2] < bbox[5],
-        ]
+    num_input_points = len(input_scene.points)
+    logger.info(f"Selecting points inside the crop bounds from {num_input_points:,} input points.")
+    point_filter_start = time.perf_counter()
+    points_mask = _points_in_bbox_mask(
+        input_scene.points,
+        bbox,
+        show_progress=num_input_points > _POINT_FILTER_BLOCK_SIZE,
+    )
+    num_selected_points = int(np.count_nonzero(points_mask))
+    selection_elapsed = time.perf_counter() - point_filter_start
+    logger.info(
+        f"Selected {num_selected_points:,} of {num_input_points:,} points inside the crop bounds "
+        f"in {selection_elapsed:.1f}s."
     )
 
-    # Mask the scene using the points mask
-    masked_scene = input_scene.filter_points(points_mask)
+    if num_selected_points == num_input_points:
+        masked_scene = input_scene
+    else:
+        logger.info("Materializing cropped point columns and remapping image visibility indices.")
+        materialization_start = time.perf_counter()
+        masked_scene = input_scene.filter_points(points_mask)
+        logger.info(f"Materialized cropped point data in {time.perf_counter() - materialization_start:.1f}s.")
 
     # How many zeros to pad the image index in the mask file names
     num_zeropad = len(str(len(masked_scene.images))) + 2
     image_ids = np.asarray([image.image_id for image in masked_scene.images], dtype=np.int64)
     if len(np.unique(image_ids)) != len(image_ids):
         raise ValueError("CropScene requires unique image IDs for deterministic cache filenames")
+    logger.info(f"Fingerprinting crop-mask inputs for {len(masked_scene.images):,} images.")
+    fingerprint_start = time.perf_counter()
     expected_fingerprint = build_scene_cache_fingerprint(
         masked_scene,
         algorithm="crop_scene_bbox_mask",
@@ -257,6 +320,7 @@ def _crop_scene_to_bbox(
         },
         include_source_images=False,
     )
+    logger.info(f"Finished fingerprinting crop-mask inputs in {time.perf_counter() - fingerprint_start:.1f}s.")
 
     new_image_metadata = []
     transform_data: dict = {}

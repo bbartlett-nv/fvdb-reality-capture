@@ -3,9 +3,12 @@
 #
 import pathlib
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 
 import numpy as np
 import pycolmap
+import tqdm
+
 from ..enums import CameraModel
 
 from .sfm_metadata import SfmCameraMetadata
@@ -232,6 +235,11 @@ class COLMAPAdapter(Adapter):
     def points_from_scene(
         self,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[int, int], dict[int, np.ndarray]]:
+        """Return source points and visibility using the legacy combined layout.
+
+        The COLMAP scene loader uses the split methods below so a warm visibility
+        cache does not incur these legacy per-point allocations.
+        """
         point3D_items = sorted(
             (int(point3D_id), point3D) for point3D_id, point3D in self._reconstruction.points3D.items()
         )
@@ -263,6 +271,49 @@ class COLMAPAdapter(Adapter):
             point3D_id_to_point3D_idx,
             point3D_id_to_images,
         )
+
+    def point_columns_from_scene(
+        self, *, show_progress: bool = False
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        num_points = len(self._reconstruction.points3D)
+        point3D_ids = np.fromiter(
+            (int(point3D_id) for point3D_id in self._reconstruction.points3D.keys()),
+            dtype=np.uint64,
+            count=num_points,
+        )
+        point3D_ids.sort()
+
+        points3D = np.empty((num_points, 3), dtype=np.float32)
+        point3D_colors = np.empty((num_points, 3), dtype=np.uint8)
+        point3D_errors = np.empty(num_points, dtype=np.float32)
+
+        point_id_iterator = tqdm.tqdm(
+            point3D_ids,
+            desc="Loading COLMAP point attributes",
+            unit="point",
+            disable=not show_progress,
+        )
+        for point3D_idx, point3D_id in enumerate(point_id_iterator):
+            point3D = self._reconstruction.points3D[int(point3D_id)]
+            points3D[point3D_idx] = point3D.xyz
+            point3D_colors[point3D_idx] = point3D.color
+            point3D_errors[point3D_idx] = float(point3D.error)
+
+        return points3D, point3D_ids, point3D_colors, point3D_errors
+
+    def iter_point_observations(
+        self, point3D_ids: np.ndarray, *, show_progress: bool = False
+    ) -> Iterator[tuple[int, int, int]]:
+        point_id_iterator = tqdm.tqdm(
+            point3D_ids,
+            desc="Reading COLMAP point visibility",
+            unit="point",
+            disable=not show_progress,
+        )
+        for point3D_idx, point3D_id in enumerate(point_id_iterator):
+            point3D = self._reconstruction.points3D[int(point3D_id)]
+            for track_element in point3D.track.elements:
+                yield point3D_idx, int(track_element.image_id), int(track_element.point2D_idx)
 
     @property
     def visibility_cache_loader(self) -> str:

@@ -3,6 +3,7 @@
 #
 
 import logging
+import os
 import pathlib
 import time
 from abc import ABC, abstractmethod
@@ -273,6 +274,41 @@ class GaussianSplatReconstructionWriter(GaussianSplatReconstructionBaseWriter):
                 self._tensorboard_path = None
                 self._tb_writer = None
 
+    def close(self) -> None:
+        """Flush and close persistent logging resources. This method is idempotent."""
+
+        first_error: Exception | None = None
+        metrics_file = getattr(self, "_metrics_log_file_handle", None)
+        self._metrics_log_file_handle = None
+        if metrics_file is not None:
+            try:
+                metrics_file.flush()
+                os.fsync(metrics_file.fileno())
+            except Exception as error:
+                first_error = error
+            finally:
+                metrics_file.close()
+
+        tensorboard_writer = getattr(self, "_tb_writer", None)
+        self._tb_writer = None
+        if tensorboard_writer is not None:
+            try:
+                tensorboard_writer.flush()
+                tensorboard_writer.close()
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+
+        if first_error is not None:
+            raise first_error
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            # Destructors cannot report cleanup failures. Explicit callers use close().
+            pass
+
     @staticmethod
     def _to_batched_uint8_image(image: torch.Tensor):
         """
@@ -400,7 +436,7 @@ class GaussianSplatReconstructionWriter(GaussianSplatReconstructionBaseWriter):
                 attempts += 1
                 self._logger.debug(f"Results directory {log_path} already exists. Attempting to create a new one.")
                 # Generate a new run name with an incremented attempt number
-                run_name = f"{prefix}_{time.strftime('%Y-%m-%d-%H-%M-%S')}_{attempts+1:02d}"
+                run_name = f"{prefix}_{time.strftime('%Y-%m-%d-%H-%M-%S')}_{attempts + 1:02d}"
                 continue
         if attempts >= max_attempts:
             raise FileExistsError(f"Failed to generate a unique log directory name after {max_attempts} attempts.")

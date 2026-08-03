@@ -4,6 +4,15 @@
 
 from .depth_map_attribute import DepthMapAttribute, DepthMissingPolicy, DepthScale
 from .adapter import Adapter, COLMAPAdapter
+from .colmap_partial import (
+    ColmapBinaryPointSource,
+    ColmapPointSelection,
+    TracklessColmapSceneSource,
+    UnsupportedColmapPartialLoadError,
+    load_colmap_metadata_scene,
+    load_colmap_scene_partial,
+    probe_trackless_colmap_binary,
+)
 from .scene_attribute import (
     InterpolationMode,
     PerCameraAttribute,
@@ -30,11 +39,18 @@ __all__ = [
     "SceneAttribute",
     "Adapter",
     "COLMAPAdapter",
+    "ColmapBinaryPointSource",
+    "ColmapPointSelection",
     "SfmCameraMetadata",
     "SfmPosedImageMetadata",
     "SfmScene",
     "SfmCache",
     "SpatialScaleMode",
+    "TracklessColmapSceneSource",
     "TransformMode",
+    "UnsupportedColmapPartialLoadError",
+    "load_colmap_scene_partial",
+    "load_colmap_metadata_scene",
+    "probe_trackless_colmap_binary",
     "scene_attribute",
 ]

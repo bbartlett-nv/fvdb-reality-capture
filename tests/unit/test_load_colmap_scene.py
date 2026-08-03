@@ -59,7 +59,13 @@ class FakePoint3D:
         self.xyz = xyz
         self.color = color
         self.error = error
-        self.track = FakeTrack(track)
+        self._track = FakeTrack(track)
+        self.track_access_count = 0
+
+    @property
+    def track(self) -> FakeTrack:
+        self.track_access_count += 1
+        return self._track
 
 
 class FakeReconstruction:
@@ -179,6 +185,22 @@ class LoadColmapSceneTests(unittest.TestCase):
                 return_value=reconstruction,
             ):
                 loaded_cameras, loaded_images, points, points_err, points_rgb, cache = load_colmap_scene(colmap_path)
+                self.assertEqual([point.track_access_count for point in points3D.values()], [1, 1])
+
+                for point in points3D.values():
+                    point.track_access_count = 0
+                reconstruction.points3D = dict(reversed(tuple(reconstruction.points3D.items())))
+                warm_scene = load_colmap_scene(colmap_path)
+                self.assertEqual([point.track_access_count for point in points3D.values()], [0, 0])
+                np.testing.assert_array_equal(warm_scene[2], points)
+                for cold_image, warm_image in zip(loaded_images, warm_scene[1]):
+                    np.testing.assert_array_equal(warm_image.point_indices, cold_image.point_indices)
+
+                for point in points3D.values():
+                    point.track_access_count = 0
+                reconstruction.points3D = {12: points3D[11], 13: points3D[13]}
+                load_colmap_scene(colmap_path)
+                self.assertEqual([point.track_access_count for point in points3D.values()], [1, 1])
 
             self.assertEqual(set(loaded_cameras.keys()), {1, 2})
             self.assertEqual([image.image_id for image in loaded_images], [0, 1, 2])
@@ -206,5 +228,12 @@ class LoadColmapSceneTests(unittest.TestCase):
             np.testing.assert_allclose(points, np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32))
             np.testing.assert_allclose(points_err, np.array([0.1, 0.2], dtype=np.float32))
             np.testing.assert_array_equal(points_rgb, np.array([[255, 0, 0], [0, 255, 0]], dtype=np.uint8))
+            self.assertEqual(points.dtype, np.float32)
+            self.assertEqual(points_err.dtype, np.float32)
+            self.assertEqual(points_rgb.dtype, np.uint8)
             self.assertTrue((colmap_path / "_cache").exists())
             self.assertTrue(cache.has_file("visible_points_per_image"))
+
+
+if __name__ == "__main__":
+    unittest.main()

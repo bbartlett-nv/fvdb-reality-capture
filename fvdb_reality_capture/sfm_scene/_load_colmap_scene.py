@@ -6,7 +6,6 @@ import logging
 import pathlib
 
 import numpy as np
-import tqdm
 
 from .adapter import COLMAPAdapter
 from .sfm_cache import SfmCache
@@ -32,23 +31,21 @@ def load_colmap_scene(colmap_path: pathlib.Path):
     Returns:
         sfm_scene (SfmScene): An in-memory representation of the SfmScene for the output of the COLMAP run.
     """
+    logger = logging.getLogger(f"{__name__}.load_colmap_scene")
+
+    logger.info("Loading COLMAP reconstruction...")
     adapter = COLMAPAdapter(colmap_path)
     colmap_image_ids = adapter.registered_image_ids()
     num_images = len(colmap_image_ids)
+    logger.info("Loading COLMAP point attributes...")
 
-    (
-        points3D,
-        point3D_ids,
-        point3D_colors,
-        point3D_errors,
-        point3D_id_to_point3D_idx,
-        point3D_id_to_images,
-    ) = adapter.points_from_scene()
+    points3D, point3D_ids, point3D_colors, point3D_errors = adapter.point_columns_from_scene(show_progress=True)
     point3D_id_order_hash = _point_id_order_hash(point3D_ids)
+    logger.info("Loaded %d registered images and %d COLMAP points.", num_images, len(points3D))
 
     cache = SfmCache.get_cache(colmap_path / "_cache", "sfm_dataset_cache", "Cache for SFM dataset")
 
-    logger = logging.getLogger(f"{__name__}.load_colmap_scene")
+    logger.info("Loading COLMAP camera and image metadata...")
 
     image_world_to_cam_mats = []
     image_camera_ids = []
@@ -92,7 +89,8 @@ def load_colmap_scene(colmap_path: pathlib.Path):
     image_absolute_paths = [image_absolute_paths[i] for i in sort_indices]
 
     # Compute the set of 3D points visible in each image
-    if cache.has_file("visible_points_per_image"):
+    has_visibility_cache = cache.has_file("visible_points_per_image")
+    if has_visibility_cache:
         key_meta = cache.get_file_metadata("visible_points_per_image")
         value_meta = key_meta["metadata"]
         if (
@@ -104,21 +102,17 @@ def load_colmap_scene(colmap_path: pathlib.Path):
         ):
             logger.info("Cached visible points per image do not match current scene. Recomputing...")
             cache.delete_file("visible_points_per_image")
+            has_visibility_cache = False
 
-    if cache.has_file("visible_points_per_image"):
+    if has_visibility_cache:
         logger.info("Loading visible points per image from cache...")
         _, point_indices = cache.read_file("visible_points_per_image")
     else:
         logger.info("Computing and caching visible points per image...")
-        # For each point, get the images that see it
-        point_indices = dict()  # Map from image names to point indices
-        for point_id, data in tqdm.tqdm(point3D_id_to_images.items()):
-            # For each image that sees this point, add the index of the point
-            # to a list of points corresponding to that image
-            for image_id, _ in data:
-                point_idx = point3D_id_to_point3D_idx[point_id]
-                point_indices.setdefault(int(image_id), []).append(point_idx)
-        point_indices = {k: np.array(v).astype(np.int32) for k, v in point_indices.items()}
+        point_indices = {}
+        for point_idx, image_id, _ in adapter.iter_point_observations(point3D_ids, show_progress=True):
+            point_indices.setdefault(image_id, []).append(point_idx)
+        point_indices = {image_id: np.asarray(indices, dtype=np.int32) for image_id, indices in point_indices.items()}
         cache.write_file(
             name="visible_points_per_image",
             data=point_indices,
@@ -131,7 +125,7 @@ def load_colmap_scene(colmap_path: pathlib.Path):
             data_type="pt",
         )
 
-    # Create SfmPosedImageMetadata objects for each image
+    logger.info("Building metadata for %d registered COLMAP images...", num_images)
     loaded_images = [
         SfmPosedImageMetadata(
             world_to_camera_matrix=image_world_to_cam_mats[i].copy(),
@@ -150,11 +144,9 @@ def load_colmap_scene(colmap_path: pathlib.Path):
         for i in range(len(image_file_names))
     ]
 
-    # Transform the points to the normalized coordinate system and cast to the right types
-    # Note: we do not normalize the point errors or colors, they are already in the correct format.
-    # Note: we don't transform the point errors
-    points = points3D.astype(np.float32)  # type: ignore (num_points, 3)
-    points_err = point3D_errors.astype(np.float32)  # type: ignore
-    points_rgb = point3D_colors.astype(np.uint8)  # type: ignore
+    # The adapter materializes final scene dtypes directly to avoid full-size conversion copies.
+    points = points3D
+    points_err = point3D_errors
+    points_rgb = point3D_colors
 
     return loaded_cameras, loaded_images, points, points_err, points_rgb, cache
