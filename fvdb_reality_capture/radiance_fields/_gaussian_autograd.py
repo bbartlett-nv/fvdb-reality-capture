@@ -1,8 +1,7 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
-"""Python torch.autograd.Function wrappers for Gaussian splatting dispatch functions.
-"""
+"""Python torch.autograd.Function wrappers for Gaussian splatting dispatch functions."""
 
 from __future__ import annotations
 
@@ -41,6 +40,8 @@ class _ProjectGaussiansFn(torch.autograd.Function):
         accum_grad_norms: torch.Tensor | None = None,
         accum_step_counts: torch.Tensor | None = None,
         accum_max_radii: torch.Tensor | None = None,
+        accumulation_tile_summed_area_table: torch.Tensor | None = None,
+        accumulation_tile_size: int = 0,
     ):
         result = _C.project_gaussians_analytic_fwd(
             means,
@@ -66,6 +67,8 @@ class _ProjectGaussiansFn(torch.autograd.Function):
         to_save = [means, quats, log_scales, world_to_cam, projection_matrices, radii, conics]
         if compensations is not None:
             to_save.append(compensations)
+        if accumulation_tile_summed_area_table is not None:
+            to_save.extend((means2d, accumulation_tile_summed_area_table))
         ctx.save_for_backward(*to_save)
 
         ctx.image_width = image_width
@@ -76,6 +79,8 @@ class _ProjectGaussiansFn(torch.autograd.Function):
         ctx.accum_grad_norms = accum_grad_norms
         ctx.accum_step_counts = accum_step_counts
         ctx.accum_max_radii = accum_max_radii
+        ctx.has_accumulation_tile_summed_area_table = accumulation_tile_summed_area_table is not None
+        ctx.accumulation_tile_size = accumulation_tile_size
 
         if compensations is not None:
             return radii, means2d, depths, conics, compensations
@@ -108,7 +113,15 @@ class _ProjectGaussiansFn(torch.autograd.Function):
         projection_matrices = saved[4]
         radii = saved[5]
         conics = saved[6]
-        compensations = saved[7] if ctx.calc_compensations else None
+        next_saved_index = 7
+        compensations = saved[next_saved_index] if ctx.calc_compensations else None
+        next_saved_index += int(ctx.calc_compensations)
+        if ctx.has_accumulation_tile_summed_area_table:
+            means2d = saved[next_saved_index]
+            accumulation_tile_summed_area_table = saved[next_saved_index + 1]
+        else:
+            means2d = None
+            accumulation_tile_summed_area_table = None
 
         assert grad_means2d is not None
         assert grad_depths is not None
@@ -134,6 +147,9 @@ class _ProjectGaussiansFn(torch.autograd.Function):
             ctx.accum_grad_norms,
             ctx.accum_max_radii,
             ctx.accum_step_counts,
+            means2d if accumulation_tile_summed_area_table is not None else None,
+            accumulation_tile_summed_area_table,
+            ctx.accumulation_tile_size,
         )
 
         return (
@@ -141,6 +157,8 @@ class _ProjectGaussiansFn(torch.autograd.Function):
             d_quats,
             d_scales,
             d_w2c,
+            None,
+            None,
             None,
             None,
             None,

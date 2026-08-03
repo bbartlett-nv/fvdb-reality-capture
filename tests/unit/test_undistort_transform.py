@@ -254,6 +254,70 @@ class UndistortImagesTransformTests(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "does not support image undistortion"):
             transform(scene)
 
+    def test_undistort_bool_npy_masks_are_canonical_and_source_content_invalidates_cache(self):
+        scene, _, _ = self._make_scene(distortion_coeffs=_packed_radtan5_coeffs())
+        source_mask = np.zeros((14, 18), dtype=np.bool_)
+        source_mask[2:12, 3:15] = True
+        source_mask_path = self.root / "source_mask.npy"
+        np.save(source_mask_path, source_mask)
+        source_image = scene.images[0]
+        masked_image = SfmPosedImageMetadata(
+            world_to_camera_matrix=source_image.world_to_camera_matrix,
+            camera_to_world_matrix=source_image.camera_to_world_matrix,
+            camera_metadata=source_image.camera_metadata,
+            camera_id=source_image.camera_id,
+            image_path=source_image.image_path,
+            mask_path=str(source_mask_path),
+            point_indices=source_image.point_indices,
+            image_id=source_image.image_id,
+        )
+        masked_scene = scene.replace(images=[masked_image])
+        transform = UndistortImages()
+
+        first_output = transform(masked_scene)
+        first_mask_path = first_output.images[0].mask_path
+        persisted = cv2.imread(first_mask_path, cv2.IMREAD_UNCHANGED)
+        self.assertIsNotNone(persisted)
+        self.assertTrue(set(np.unique(persisted)).issubset({0, 255}))
+
+        self.assertTrue(cv2.imwrite(first_mask_path, (persisted > 0).astype(np.uint8)))
+        repaired_output = transform(masked_scene)
+        repaired = cv2.imread(repaired_output.images[0].mask_path, cv2.IMREAD_UNCHANGED)
+        self.assertIsNotNone(repaired)
+        self.assertTrue(set(np.unique(repaired)).issubset({0, 255}))
+
+        changed_source_mask = np.roll(source_mask, shift=1, axis=1)
+        self.assertEqual(int(changed_source_mask.sum()), int(source_mask.sum()))
+        np.save(source_mask_path, changed_source_mask)
+        with patch.object(
+            UndistortImages,
+            "_undistort_and_crop",
+            wraps=UndistortImages._undistort_and_crop,
+        ) as undistort_and_crop:
+            changed_output = transform(masked_scene)
+        self.assertEqual(undistort_and_crop.call_count, 2)
+        changed = cv2.imread(changed_output.images[0].mask_path, cv2.IMREAD_UNCHANGED)
+        self.assertIsNotNone(changed)
+        self.assertTrue(set(np.unique(changed)).issubset({0, 255}))
+        self.assertFalse(np.array_equal(changed, repaired))
+
+    def test_undistort_rejects_declared_missing_mask(self):
+        scene, _, _ = self._make_scene(distortion_coeffs=_packed_radtan5_coeffs())
+        source_image = scene.images[0]
+        missing_image = SfmPosedImageMetadata(
+            world_to_camera_matrix=source_image.world_to_camera_matrix,
+            camera_to_world_matrix=source_image.camera_to_world_matrix,
+            camera_metadata=source_image.camera_metadata,
+            camera_id=source_image.camera_id,
+            image_path=source_image.image_path,
+            mask_path=str(self.root / "missing.npy"),
+            point_indices=source_image.point_indices,
+            image_id=source_image.image_id,
+        )
+
+        with self.assertRaisesRegex(FileNotFoundError, "Declared mask file does not exist"):
+            UndistortImages()(scene.replace(images=[missing_image]))
+
 
 if __name__ == "__main__":
     unittest.main()

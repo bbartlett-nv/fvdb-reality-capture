@@ -3,66 +3,50 @@
 #
 
 import logging
-import os
 from typing import Literal
 
-import cv2
 import numpy as np
 import torch
 import tqdm
 from fvdb.types import NumericMaxRank1, to_VecNf
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, QhullError
 
+from fvdb_reality_capture.enums import CameraModel
+from fvdb_reality_capture.mask_utils import (
+    bbox_metadata_contains_mask,
+    build_scene_cache_fingerprint,
+    cache_fingerprint_matches,
+    encode_binary_mask,
+    load_binary_mask,
+    mask_bbox_xyxy_count as _mask_bbox_xyxy_count,
+    mask_path_is_declared,
+)
 from fvdb_reality_capture.sfm_scene import SfmCache, SfmPosedImageMetadata, SfmScene
 from fvdb_reality_capture.sfm_scene.scene_attribute import CROP_MASK_BBOX_ATTRIBUTE, PerImageValueAttribute
 
 from .base_transform import BaseTransform, transform
 
-_MASK_BBOX_MANIFEST_VERSION = 1
+_MASK_BBOX_MANIFEST_VERSION = 2
 _MASK_BBOX_MANIFEST_VERSION_KEY = "crop_mask_bbox_manifest_version"
 _MASK_BBOX_IMAGE_IDS_KEY = "crop_mask_bbox_image_ids"
+_MASK_CACHE_FINGERPRINT_KEY = "crop_mask_cache_fingerprint"
+_MASK_PROJECTION_ALGORITHM_VERSION = 2
 _MAX_RASTER_WORKSPACE_BYTES = 64 * 1024 * 1024
-
-
-def _mask_bbox_xyxy_count(mask: np.ndarray) -> np.ndarray:
-    """Return ``[xmin, ymin, xmax, ymax, count]`` for pixels that are valid under dataset mask semantics."""
-    if mask.ndim == 3:
-        mask = mask[..., 0]
-    elif mask.ndim != 2:
-        raise ValueError(f"Unsupported mask shape: {mask.shape}. Must have 2D or 3D shape.")
-
-    if mask.dtype == np.bool_:
-        valid = mask
-    else:
-        is_normalized = mask.size > 0 and np.max(mask) <= 1
-        if np.issubdtype(mask.dtype, np.floating):
-            # Normalized floating-point masks use conventional probability semantics.
-            threshold = 0.5 if is_normalized else 127
-        else:
-            # Binary integer masks use 0/1, while byte-range masks use 0/255.
-            threshold = 0 if is_normalized else 127
-        valid = mask > threshold
-    valid_count = int(np.count_nonzero(valid))
-    if valid_count == 0:
-        return np.zeros((5,), dtype=np.int64)
-
-    valid_rows = np.flatnonzero(np.any(valid, axis=1))
-    valid_columns = np.flatnonzero(np.any(valid, axis=0))
-    return np.array(
-        [valid_columns[0], valid_rows[0], valid_columns[-1] + 1, valid_rows[-1] + 1, valid_count],
-        dtype=np.int64,
-    )
-
-
-def _read_mask(mask_path: str) -> np.ndarray:
-    if mask_path.strip().endswith(".npy"):
-        return np.load(mask_path)
-    if mask_path.strip().endswith((".png", ".jpg", ".jpeg")):
-        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            raise ValueError(f"Failed to load mask {mask_path}")
-        return mask
-    raise ValueError(f"Unsupported mask file format: {mask_path}")
+_PINHOLE_NEAR_PLANE = 1.0e-6
+_BBOX_EDGE_INDICES = (
+    (0, 1),
+    (0, 2),
+    (0, 4),
+    (1, 3),
+    (1, 5),
+    (2, 3),
+    (2, 6),
+    (3, 7),
+    (4, 5),
+    (4, 6),
+    (5, 7),
+    (6, 7),
+)
 
 
 def _rasterize_convex_hull_mask(convex_hull: ConvexHull, image_height: int, image_width: int) -> np.ndarray:
@@ -101,8 +85,90 @@ def _rasterize_convex_hull_mask(convex_hull: ConvexHull, image_height: int, imag
     return inside_mask
 
 
-def _get_cached_mask_bboxes(transform_data: dict, image_ids: np.ndarray) -> np.ndarray | None:
+def _bbox_world_corners(bbox: np.ndarray) -> np.ndarray:
+    min_x, min_y, min_z, max_x, max_y, max_z = bbox
+    return np.array(
+        [
+            [min_x, min_y, min_z, 1.0],
+            [min_x, min_y, max_z, 1.0],
+            [min_x, max_y, min_z, 1.0],
+            [min_x, max_y, max_z, 1.0],
+            [max_x, min_y, min_z, 1.0],
+            [max_x, min_y, max_z, 1.0],
+            [max_x, max_y, min_z, 1.0],
+            [max_x, max_y, max_z, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _project_bbox_mask(image_meta: SfmPosedImageMetadata, bbox: np.ndarray) -> np.ndarray:
+    """Project a world-space AABB into an undistorted pinhole image."""
+    camera = image_meta.camera_metadata
+    image_shape = (camera.height, camera.width)
+    if camera.camera_model != CameraModel.PINHOLE:
+        raise NotImplementedError(
+            "CropScene bbox masks currently support only undistorted PINHOLE cameras; "
+            f"image {image_meta.image_id} uses {camera.camera_model.name}. "
+            "Apply UndistortImages before CropScene."
+        )
+    if camera.distortion_coeffs.size != 0 and np.any(np.abs(camera.distortion_coeffs) > 1.0e-12):
+        raise NotImplementedError(
+            "CropScene bbox masks do not support nonzero distortion on PINHOLE metadata; "
+            f"image {image_meta.image_id} must be undistorted first."
+        )
+
+    camera_origin_h = np.asarray(image_meta.camera_to_world_matrix, dtype=np.float64) @ np.array([0.0, 0.0, 0.0, 1.0])
+    if abs(float(camera_origin_h[3])) <= np.finfo(np.float64).eps:
+        raise ValueError(f"Camera-to-world matrix has an invalid homogeneous origin for image {image_meta.image_id}")
+    camera_origin = camera_origin_h[:3] / camera_origin_h[3]
+    if np.all(camera_origin >= bbox[:3]) and np.all(camera_origin <= bbox[3:]):
+        return np.ones(image_shape, dtype=np.bool_)
+
+    corners_world = _bbox_world_corners(bbox)
+    corners_camera_h = (np.asarray(image_meta.world_to_camera_matrix, dtype=np.float64) @ corners_world.T).T
+    if np.any(np.abs(corners_camera_h[:, 3]) <= np.finfo(np.float64).eps):
+        raise ValueError(
+            f"World-to-camera matrix produced invalid homogeneous bbox corners for image {image_meta.image_id}"
+        )
+    corners_camera = corners_camera_h[:, :3] / corners_camera_h[:, 3:4]
+    if float(np.max(corners_camera[:, 2])) <= _PINHOLE_NEAR_PLANE:
+        return np.zeros(image_shape, dtype=np.bool_)
+
+    clipped_points = [point for point in corners_camera if point[2] >= _PINHOLE_NEAR_PLANE]
+    for start_index, end_index in _BBOX_EDGE_INDICES:
+        start = corners_camera[start_index]
+        end = corners_camera[end_index]
+        start_side = float(start[2] - _PINHOLE_NEAR_PLANE)
+        end_side = float(end[2] - _PINHOLE_NEAR_PLANE)
+        if start_side * end_side < 0.0:
+            interpolation = (_PINHOLE_NEAR_PLANE - start[2]) / (end[2] - start[2])
+            clipped_points.append(start + interpolation * (end - start))
+
+    if len(clipped_points) < 3:
+        return np.zeros(image_shape, dtype=np.bool_)
+    clipped_camera = np.unique(np.asarray(clipped_points, dtype=np.float64), axis=0)
+    projected_h = (np.asarray(camera.projection_matrix, dtype=np.float64) @ clipped_camera.T).T
+    projected = projected_h[:, :2] / projected_h[:, 2:3]
+    projected = projected[np.all(np.isfinite(projected), axis=1)]
+    if len(projected) < 3:
+        return np.zeros(image_shape, dtype=np.bool_)
+
+    try:
+        convex_hull = ConvexHull(projected)
+    except QhullError:
+        return np.zeros(image_shape, dtype=np.bool_)
+    return _rasterize_convex_hull_mask(convex_hull, camera.height, camera.width)
+
+
+def _get_cached_mask_bboxes(
+    transform_data: dict,
+    image_ids: np.ndarray,
+    expected_fingerprint: dict,
+) -> np.ndarray | None:
     if transform_data.get(_MASK_BBOX_MANIFEST_VERSION_KEY) != _MASK_BBOX_MANIFEST_VERSION:
+        return None
+    if not cache_fingerprint_matches(transform_data.get(_MASK_CACHE_FINGERPRINT_KEY), expected_fingerprint):
         return None
 
     cached_image_ids = np.asarray(transform_data.get(_MASK_BBOX_IMAGE_IDS_KEY, []), dtype=np.int64)
@@ -119,6 +185,7 @@ def _write_transform_manifest(
     transformation_matrix: np.ndarray,
     image_ids: np.ndarray,
     mask_bboxes: np.ndarray,
+    fingerprint: dict,
 ) -> None:
     output_cache.write_file(
         "transform",
@@ -126,6 +193,7 @@ def _write_transform_manifest(
             "transform": transformation_matrix,
             _MASK_BBOX_MANIFEST_VERSION_KEY: _MASK_BBOX_MANIFEST_VERSION,
             _MASK_BBOX_IMAGE_IDS_KEY: image_ids,
+            _MASK_CACHE_FINGERPRINT_KEY: fingerprint,
             CROP_MASK_BBOX_ATTRIBUTE: mask_bboxes,
         },
         data_type="pt",
@@ -136,12 +204,14 @@ def _crop_scene_to_bbox(
     input_scene: SfmScene,
     transform_name: str,
     composite_with_existing_masks: bool,
-    mask_format: str,
+    mask_format: Literal["png", "jpg", "npy"],
     bbox: np.ndarray,
     logger: logging.Logger,
 ):
     if bbox.shape != (6,):
         raise ValueError("Bounding box must be a 1D array of shape (6,)")
+    if np.any(bbox[:3] >= bbox[3:]):
+        raise ValueError(f"Bounding box minima must be strictly less than maxima; got {bbox}")
 
     output_cache_prefix = f"{transform_name}_{bbox[0]}_{bbox[1]}_{bbox[2]}_{bbox[3]}_{bbox[4]}_{bbox[5]}_{mask_format}_{composite_with_existing_masks}"
     output_cache_prefix = output_cache_prefix.replace(" ", "_")  # Ensure no spaces in the cache prefix
@@ -173,10 +243,24 @@ def _crop_scene_to_bbox(
     # How many zeros to pad the image index in the mask file names
     num_zeropad = len(str(len(masked_scene.images))) + 2
     image_ids = np.asarray([image.image_id for image in masked_scene.images], dtype=np.int64)
+    if len(np.unique(image_ids)) != len(image_ids):
+        raise ValueError("CropScene requires unique image IDs for deterministic cache filenames")
+    expected_fingerprint = build_scene_cache_fingerprint(
+        masked_scene,
+        algorithm="crop_scene_bbox_mask",
+        algorithm_version=_MASK_PROJECTION_ALGORITHM_VERSION,
+        settings={
+            "bbox": bbox,
+            "mask_format": mask_format,
+            "composite_with_existing_masks": composite_with_existing_masks,
+            "near_plane": _PINHOLE_NEAR_PLANE,
+        },
+        include_source_images=False,
+    )
 
     new_image_metadata = []
-    cached_mask_paths: list[str] = []
     transform_data: dict = {}
+    mask_bboxes: np.ndarray | None = None
 
     regenerate_cache = False
     if output_cache.num_files != len(masked_scene.images) + 1:
@@ -221,7 +305,14 @@ def _crop_scene_to_bbox(
         output_cache.clear_current_folder()
         regenerate_cache = True
 
-    for image_meta in masked_scene.images:
+    if not regenerate_cache:
+        mask_bboxes = _get_cached_mask_bboxes(transform_data, image_ids, expected_fingerprint)
+        if mask_bboxes is None:
+            logger.info("Cached crop-mask manifest is legacy, malformed, or stale; regenerating masks.")
+            output_cache.clear_current_folder()
+            regenerate_cache = True
+
+    for image_position, image_meta in enumerate(masked_scene.images):
         if regenerate_cache:
             break
         image_cache_filename = f"mask_{image_meta.image_id:0{num_zeropad}}"
@@ -243,7 +334,35 @@ def _crop_scene_to_bbox(
             regenerate_cache = True
             break
         mask_path = str(key_meta["path"])
-        cached_mask_paths.append(mask_path)
+        try:
+            decoded_mask = load_binary_mask(mask_path)
+        except (FileNotFoundError, TypeError, ValueError) as error:
+            logger.info(f"Cached mask {mask_path} is unreadable ({error}); regenerating masks.")
+            output_cache.clear_current_folder()
+            regenerate_cache = True
+            break
+        expected_shape = (image_meta.camera_metadata.height, image_meta.camera_metadata.width)
+        if decoded_mask.shape != expected_shape:
+            logger.info(
+                f"Cached mask {mask_path} has shape {decoded_mask.shape}, expected {expected_shape}; regenerating masks."
+            )
+            output_cache.clear_current_folder()
+            regenerate_cache = True
+            break
+        assert mask_bboxes is not None
+        if mask_format != "jpg":
+            _, raw_cached_mask = output_cache.read_file(image_cache_filename)
+            if not np.array_equal(raw_cached_mask, encode_binary_mask(decoded_mask, mask_format)):
+                logger.info(f"Cached mask {mask_path} does not use canonical {mask_format} encoding; regenerating.")
+                output_cache.clear_current_folder()
+                regenerate_cache = True
+                break
+        decoded_bbox = _mask_bbox_xyxy_count(decoded_mask)
+        if not bbox_metadata_contains_mask(mask_bboxes[image_position], decoded_bbox):
+            logger.info(f"Cached bbox metadata does not contain decoded mask {mask_path}; regenerating masks.")
+            output_cache.clear_current_folder()
+            regenerate_cache = True
+            break
         new_image_metadata.append(
             SfmPosedImageMetadata(
                 world_to_camera_matrix=image_meta.world_to_camera_matrix,
@@ -257,88 +376,31 @@ def _crop_scene_to_bbox(
             )
         )
 
-    mask_bboxes = None
-    if not regenerate_cache:
-        mask_bboxes = _get_cached_mask_bboxes(transform_data, image_ids)
-        if mask_bboxes is None:
-            logger.info("Upgrading cached crop masks with per-image bounding-box metadata.")
-            mask_bboxes = np.asarray(
-                [_mask_bbox_xyxy_count(_read_mask(mask_path)) for mask_path in cached_mask_paths], dtype=np.int64
-            ).reshape((-1, 5))
-            _write_transform_manifest(
-                output_cache,
-                input_scene.transformation_matrix,
-                image_ids,
-                mask_bboxes,
-            )
-
     if regenerate_cache:
         logger.info("Computing image masks for cropping and saving to cache.")
         new_image_metadata = []
         mask_bbox_rows: list[np.ndarray] = []
 
-        min_x, min_y, min_z, max_x, max_y, max_z = bbox
-
-        # (8, 4)-shaped array representing the corners of the bounding cube containing the input points
-        # in homogeneous coordinates
-        cube_bounds_world_space_homogeneous = np.array(
-            [
-                [min_x, min_y, min_z, 1.0],
-                [min_x, min_y, max_z, 1.0],
-                [min_x, max_y, min_z, 1.0],
-                [min_x, max_y, max_z, 1.0],
-                [max_x, min_y, min_z, 1.0],
-                [max_x, min_y, max_z, 1.0],
-                [max_x, max_y, min_z, 1.0],
-                [max_x, max_y, max_z, 1.0],
-            ]
-        )
-
         for image_meta in tqdm.tqdm(masked_scene.images, unit="imgs", desc="Computing image masks for cropping"):
-            cam_meta = image_meta.camera_metadata
+            inside_mask = _project_bbox_mask(image_meta, bbox)
 
-            # Transform the cube corners to camera space
-            cube_bounds_cam_space = image_meta.world_to_camera_matrix @ cube_bounds_world_space_homogeneous.T  # [4, 8]
-            # Divide out the homogeneous coordinate -> [3, 8]
-            cube_bounds_cam_space = cube_bounds_cam_space[:3, :] / cube_bounds_cam_space[-1, :]
-
-            # Project the camera-space cube corners into image space [3, 3] * [8, 3] - > [8, 2]
-            cube_bounds_pixel_space = cam_meta.projection_matrix @ cube_bounds_cam_space  # [3, 8]
-            # Divide out the homogeneous coordinate and transpose -> [8, 2]
-            cube_bounds_pixel_space = (cube_bounds_pixel_space[:2, :] / cube_bounds_pixel_space[2, :]).T
-
-            # Compute and rasterize the pixel-space convex hull of the cube corners.
-            convex_hull = ConvexHull(cube_bounds_pixel_space)
-            image_width = image_meta.camera_metadata.width
-            image_height = image_meta.camera_metadata.height
-            inside_mask = _rasterize_convex_hull_mask(convex_hull, image_height, image_width)
-
-            # If the mask already exists, load it and composite this one into it
-            mask_to_save = inside_mask.astype(np.uint8) * 255  # Convert to uint8 mask
-            if os.path.exists(image_meta.mask_path) and composite_with_existing_masks:
-                existing_mask = _read_mask(image_meta.mask_path)
-                if existing_mask.ndim == 3:
-                    # Ensure the mask is 3D to match the input mask
-                    inside_mask = inside_mask[..., np.newaxis]
-                elif existing_mask.ndim != 2:
-                    raise ValueError(f"Unsupported mask shape: {existing_mask.shape}. Must have 2D or 3D shape.")
-
-                if existing_mask.shape[:2] != inside_mask.shape[:2]:
+            if mask_path_is_declared(image_meta.mask_path) and composite_with_existing_masks:
+                existing_mask = load_binary_mask(image_meta.mask_path)
+                if existing_mask.shape != inside_mask.shape:
                     raise ValueError(
-                        f"Existing mask shape {existing_mask.shape[:2]} does not match computed mask shape {inside_mask.shape[:2]}."
+                        f"Existing mask shape {existing_mask.shape} does not match camera mask shape "
+                        f"{inside_mask.shape} for image {image_meta.image_id}: {image_meta.mask_path}"
                     )
-                mask_to_save = existing_mask * inside_mask
+                inside_mask = np.logical_and(inside_mask, existing_mask)
 
+            mask_to_save = encode_binary_mask(inside_mask, mask_format)
             cache_file_meta = output_cache.write_file(
                 name=f"mask_{image_meta.image_id:0{num_zeropad}}",
                 data=mask_to_save,
                 data_type=mask_format,
             )
-            if mask_format == "jpg":
-                # JPEG is lossy, so metadata must describe the mask that downstream code will decode.
-                mask_bbox_rows.append(_mask_bbox_xyxy_count(_read_mask(str(cache_file_meta["path"]))))
-            else:
-                mask_bbox_rows.append(_mask_bbox_xyxy_count(mask_to_save))
+            persisted_mask = load_binary_mask(str(cache_file_meta["path"]))
+            mask_bbox_rows.append(_mask_bbox_xyxy_count(persisted_mask))
 
             new_image_metadata.append(
                 SfmPosedImageMetadata(
@@ -359,6 +421,7 @@ def _crop_scene_to_bbox(
             input_scene.transformation_matrix,
             image_ids,
             mask_bboxes,
+            expected_fingerprint,
         )
 
     new_attrs = {}
@@ -371,9 +434,7 @@ def _crop_scene_to_bbox(
 
     if mask_bboxes is None:
         raise RuntimeError("Crop mask bounding-box metadata was not initialized")
-    new_attrs[CROP_MASK_BBOX_ATTRIBUTE] = PerImageValueAttribute(
-        [bbox_row.copy() for bbox_row in mask_bboxes]
-    )
+    new_attrs[CROP_MASK_BBOX_ATTRIBUTE] = PerImageValueAttribute([bbox_row.copy() for bbox_row in mask_bboxes])
 
     output_scene = masked_scene.replace(
         images=new_image_metadata,
@@ -480,7 +541,12 @@ class CropScene(BaseTransform):
             raise ValueError(
                 "Bounding box must be a tuple or array of the form (min_x, min_y, min_z, max_x, max_y, max_z)."
             )
-        return CropScene(bbox)
+        mask_format = state_dict.get("mask_format", "png")
+        composite_with_existing_masks = state_dict.get(
+            "composite_into_existing_masks",
+            state_dict.get("composite_with_existing_masks", True),
+        )
+        return CropScene(bbox, mask_format=mask_format, composite_with_existing_masks=composite_with_existing_masks)
 
     def state_dict(self) -> dict:
         """
@@ -685,7 +751,7 @@ class CropSceneToPoints(BaseTransform):
         points_min = input_scene.points.min(axis=0)
         points_max = input_scene.points.max(axis=0)
         box_size = points_max - points_min
-        padding = self._margin * box_size / 0.5
+        padding = self._margin * box_size / 2.0
         points_min -= padding
         points_max += padding
         bbox = np.array(

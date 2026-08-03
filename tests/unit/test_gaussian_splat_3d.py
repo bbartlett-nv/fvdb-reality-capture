@@ -610,7 +610,6 @@ class TestGaussianSplatIndexSet(BaseGaussianTestCase):
                     )
                 )
         elif src_acc_m2d_grads and not dst_track_m2d_grads:
-
             self.assertEqual(dst.accumulated_mean_2d_gradient_norms, None)
             self.assertEqual(dst.accumulated_gradient_step_counts, None)
             # Check that the destination Gaussian Splat has the same gradient shapes as before
@@ -1375,7 +1374,6 @@ class TestLoadAndSavePly(BaseGaussianTestCase):
 
 
 class TestGaussianRender(BaseGaussianTestCase):
-
     def setUp(self):
         super().setUp()
 
@@ -1581,7 +1579,6 @@ class TestGaussianRender(BaseGaussianTestCase):
 
 
 class TestGaussianContributingGaussianIdsRender(BaseGaussianTestCase):
-
     def setUp(self):
         super().setUp()
         # Reducing width/height to reduce file size of reference test data
@@ -3561,17 +3558,42 @@ class TestGaussianRenderCrops(BaseGaussianTestCase):
             height=height,
         )
 
-    def test_non_tile_aligned_crop_backward_matches_full_render(self):
+    def test_bbox_stats_crop_backward_matches_full_render(self):
         x, y, width, height = 303, 47, 64, 64
         full_gs3d = self._clone_gaussians()
         crop_gs3d = self._clone_gaussians()
+        for gs3d in (full_gs3d, crop_gs3d):
+            gs3d.accumulate_mean_2d_gradients = True
+            gs3d.accumulate_max_2d_radii = True
+
+        num_tiles_w = (self.width + self.tile_size - 1) // self.tile_size
+        num_tiles_h = (self.height + self.tile_size - 1) // self.tile_size
+        tile_mask = torch.zeros((1, num_tiles_h, num_tiles_w), dtype=torch.bool, device=self.device)
+        tile_x0 = x // self.tile_size
+        tile_y0 = y // self.tile_size
+        tile_x1 = (x + width + self.tile_size - 1) // self.tile_size
+        tile_y1 = (y + height + self.tile_size - 1) // self.tile_size
+        tile_mask[:, tile_y0:tile_y1, tile_x0:tile_x1] = True
+
+        def project(gs3d):
+            return gs3d.project_gaussians_for_images(
+                self.cam_to_world_mats[:1],
+                self.projection_mats[:1],
+                self.width,
+                self.height,
+                self.near_plane,
+                self.far_plane,
+                sh_degree_to_use=0,
+                gradient_accumulation_tile_mask=tile_mask,
+                gradient_accumulation_tile_size=self.tile_size,
+            )
 
         full, full_alphas = full_gs3d.render_from_projected_gaussians(
-            self._project(full_gs3d),
+            project(full_gs3d),
             tile_size=self.tile_size,
         )
         crop, crop_alphas = crop_gs3d.render_from_projected_gaussians(
-            self._project(crop_gs3d),
+            project(crop_gs3d),
             crop_width=width,
             crop_height=height,
             crop_origin_w=x,
@@ -3598,6 +3620,21 @@ class TestGaussianRenderCrops(BaseGaussianTestCase):
                 self.assertIsNotNone(full_gradient)
                 self.assertIsNotNone(crop_gradient)
                 torch.testing.assert_close(full_gradient, crop_gradient, rtol=2e-4, atol=1e-5)
+
+        torch.testing.assert_close(
+            full_gs3d.accumulated_mean_2d_gradient_norms,
+            crop_gs3d.accumulated_mean_2d_gradient_norms,
+            rtol=2e-4,
+            atol=1e-5,
+        )
+        self.assertTrue(
+            torch.equal(
+                full_gs3d.accumulated_gradient_step_counts,
+                crop_gs3d.accumulated_gradient_step_counts,
+            )
+        )
+        self.assertTrue(torch.equal(full_gs3d.accumulated_max_2d_radii, crop_gs3d.accumulated_max_2d_radii))
+        self.assertGreater(full_gs3d.accumulated_gradient_step_counts.sum().item(), 0)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
@@ -3859,9 +3896,7 @@ class TestGaussianRenderMasks(BaseGaussianTestCase):
             self.far_plane,
         )
 
-        invalid_shape = torch.ones(
-            (C, self.num_tiles_h, self.num_tiles_w - 1), device=self.device, dtype=torch.bool
-        )
+        invalid_shape = torch.ones((C, self.num_tiles_h, self.num_tiles_w - 1), device=self.device, dtype=torch.bool)
         with self.assertRaisesRegex(ValueError, "tile_masks must have shape"):
             self.gs3d.render_from_projected_gaussians(projected, tile_masks=invalid_shape)
 
@@ -3906,9 +3941,7 @@ class TestGaussianRenderMasks(BaseGaussianTestCase):
             tile_masks=tile_masks,
         )
 
-        pixel_mask = tile_masks.repeat_interleave(self.tile_size, dim=1).repeat_interleave(
-            self.tile_size, dim=2
-        )
+        pixel_mask = tile_masks.repeat_interleave(self.tile_size, dim=1).repeat_interleave(self.tile_size, dim=2)
         pixel_mask = pixel_mask[:, : self.height, : self.width].unsqueeze(-1)
         torch.testing.assert_close(masked, full * pixel_mask, rtol=0.0, atol=1e-6)
         torch.testing.assert_close(masked_alphas, full_alphas * pixel_mask, rtol=0.0, atol=1e-6)
@@ -3935,6 +3968,9 @@ class TestGaussianRenderMasks(BaseGaussianTestCase):
     def test_render_from_projected_gaussians_all_zero_tile_mask_backward_has_zero_gradients(self):
         C = 1
         gs3d = self._clone_gaussians()
+        gs3d.accumulate_mean_2d_gradients = True
+        gs3d.accumulate_max_2d_radii = True
+        tile_mask = self._all_zeros_tile_mask(C)
         projected = gs3d.project_gaussians_for_images(
             self.cam_to_world_mats[:C],
             self.projection_mats[:C],
@@ -3942,11 +3978,13 @@ class TestGaussianRenderMasks(BaseGaussianTestCase):
             self.height,
             self.near_plane,
             self.far_plane,
+            gradient_accumulation_tile_mask=tile_mask,
+            gradient_accumulation_tile_size=self.tile_size,
         )
         rendered, alphas = gs3d.render_from_projected_gaussians(
             projected,
             tile_size=self.tile_size,
-            tile_masks=self._all_zeros_tile_mask(C),
+            tile_masks=tile_mask,
         )
 
         self.assertTrue(rendered.requires_grad)
@@ -3954,6 +3992,18 @@ class TestGaussianRenderMasks(BaseGaussianTestCase):
         self.assertTrue(torch.equal(rendered, torch.zeros_like(rendered)))
         self.assertTrue(torch.equal(alphas, torch.zeros_like(alphas)))
         (rendered.sum() + alphas.sum()).backward()
+        self.assertIsNotNone(gs3d.accumulated_gradient_step_counts)
+        self.assertIsNotNone(gs3d.accumulated_max_2d_radii)
+        self.assertIsNotNone(gs3d.accumulated_mean_2d_gradient_norms)
+        self.assertTrue(
+            torch.equal(gs3d.accumulated_gradient_step_counts, torch.zeros_like(gs3d.accumulated_gradient_step_counts))
+        )
+        self.assertTrue(torch.equal(gs3d.accumulated_max_2d_radii, torch.zeros_like(gs3d.accumulated_max_2d_radii)))
+        self.assertTrue(
+            torch.equal(
+                gs3d.accumulated_mean_2d_gradient_norms, torch.zeros_like(gs3d.accumulated_mean_2d_gradient_norms)
+            )
+        )
 
         for parameter_name in ("means", "quats", "log_scales", "logit_opacities", "sh0", "shN"):
             with self.subTest(parameter=parameter_name):

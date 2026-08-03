@@ -2,17 +2,29 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 import logging
-import os
 import pathlib
 from typing import Any, Literal
 
 import cv2
+import numpy as np
 import tqdm
 
+from fvdb_reality_capture.mask_utils import (
+    build_scene_cache_fingerprint,
+    cache_fingerprint_matches,
+    encode_binary_mask,
+    load_binary_mask,
+    mask_path_is_declared,
+)
 from fvdb_reality_capture.sfm_scene import SfmCache, SfmPosedImageMetadata, SfmScene
 from fvdb_reality_capture.sfm_scene.scene_attribute import CROP_MASK_BBOX_ATTRIBUTE
 
 from .base_transform import BaseTransform, transform
+
+_DOWNSAMPLE_CACHE_MANIFEST_VERSION = 1
+_DOWNSAMPLE_CACHE_MANIFEST_FILE = "manifest"
+_DOWNSAMPLE_CACHE_FINGERPRINT_KEY = "fingerprint"
+_DOWNSAMPLE_ALGORITHM_VERSION = 2
 
 
 @transform
@@ -101,6 +113,28 @@ class DownsampleImages(BaseTransform):
             self._logger.warning("No cameras found in the SfmScene. Returning the input scene unchanged.")
             return input_scene
 
+        image_ids = np.asarray([image.image_id for image in input_scene.images], dtype=np.int64)
+        if len(np.unique(image_ids)) != len(image_ids):
+            raise ValueError("DownsampleImages requires unique image IDs for deterministic cache filenames")
+        expected_fingerprint = build_scene_cache_fingerprint(
+            input_scene,
+            algorithm="downsample_images",
+            algorithm_version=_DOWNSAMPLE_ALGORITHM_VERSION,
+            settings={
+                "image_downsample_factor": self._image_downsample_factor,
+                "image_type": self._image_type,
+                "rescale_sampling_mode": self._rescale_sampling_mode,
+                "rescaled_jpeg_quality": self._rescaled_jpeg_quality,
+                "mask_sampling_mode": cv2.INTER_NEAREST_EXACT,
+                "mask_format": "png",
+            },
+            include_source_images=True,
+        )
+        expected_manifest = {
+            "version": _DOWNSAMPLE_CACHE_MANIFEST_VERSION,
+            _DOWNSAMPLE_CACHE_FINGERPRINT_KEY: expected_fingerprint,
+        }
+
         input_cache: SfmCache = input_scene.cache
         cache_prefix = f"downsampled_{self._image_downsample_factor}x_{self._image_type}_q{self._rescaled_jpeg_quality}_m{self._rescale_sampling_mode}"
         output_cache = input_cache.make_folder(
@@ -126,14 +160,9 @@ class DownsampleImages(BaseTransform):
 
         regenerate_cache = False
 
-        num_masks = sum(
-            [
-                len(str(image_meta.mask_path)) > 0 and os.path.exists(image_meta.mask_path)
-                for image_meta in input_scene.images
-            ]
-        )
+        num_masks = sum(mask_path_is_declared(image_meta.mask_path) for image_meta in input_scene.images)
 
-        if output_cache.num_files != input_scene.num_images + num_masks:
+        if output_cache.num_files != input_scene.num_images + num_masks + 1:
             if output_cache.num_files == 0:
                 self._logger.info(f"No downsampled images found in the cache.")
             else:
@@ -145,12 +174,31 @@ class DownsampleImages(BaseTransform):
             output_cache.clear_current_folder()
             regenerate_cache = True
 
-        for image_id in range(input_scene.num_images):
+        if not regenerate_cache:
+            if not output_cache.has_file(_DOWNSAMPLE_CACHE_MANIFEST_FILE):
+                self._logger.info("Downsample cache has no versioned manifest; regenerating legacy cache.")
+                output_cache.clear_current_folder()
+                regenerate_cache = True
+            else:
+                _, cached_manifest = output_cache.read_file(_DOWNSAMPLE_CACHE_MANIFEST_FILE)
+                manifest_matches = (
+                    isinstance(cached_manifest, dict)
+                    and cached_manifest.get("version") == _DOWNSAMPLE_CACHE_MANIFEST_VERSION
+                    and cache_fingerprint_matches(
+                        cached_manifest.get(_DOWNSAMPLE_CACHE_FINGERPRINT_KEY),
+                        expected_fingerprint,
+                    )
+                )
+                if not manifest_matches:
+                    self._logger.info("Downsample cache manifest is malformed or stale; regenerating cache.")
+                    output_cache.clear_current_folder()
+                    regenerate_cache = True
+
+        for image_meta in input_scene.images:
             if regenerate_cache:
                 break
 
-            cache_image_filename = f"image_{image_id:0{num_zeropad}}"
-            image_meta = input_scene.images[image_id]
+            cache_image_filename = f"image_{image_meta.image_id:0{num_zeropad}}"
             if not output_cache.has_file(cache_image_filename):
                 self._logger.info(
                     f"Image {cache_image_filename} not found in the cache. " f"Clearing cache and regenerating."
@@ -177,11 +225,39 @@ class DownsampleImages(BaseTransform):
                 regenerate_cache = True
                 break
             mask_path = ""
-            if num_masks > 0:
+            if mask_path_is_declared(image_meta.mask_path):
                 cache_mask_filename = f"mask_{image_meta.image_id:0{num_zeropad}}"
-                if output_cache.has_file(cache_mask_filename):
-                    mask_file_meta = output_cache.get_file_metadata(cache_mask_filename)
-                    mask_path = str(mask_file_meta["path"])
+                if not output_cache.has_file(cache_mask_filename):
+                    self._logger.info(f"Mask {cache_mask_filename} is missing from the cache; regenerating.")
+                    output_cache.clear_current_folder()
+                    regenerate_cache = True
+                    break
+                mask_file_meta = output_cache.get_file_metadata(cache_mask_filename)
+                mask_path = str(mask_file_meta["path"])
+                try:
+                    cached_mask = load_binary_mask(mask_path)
+                except (FileNotFoundError, TypeError, ValueError) as error:
+                    self._logger.info(f"Cached mask {mask_path} is unreadable ({error}); regenerating.")
+                    output_cache.clear_current_folder()
+                    regenerate_cache = True
+                    break
+                output_camera = new_camera_metadata[image_meta.camera_id]
+                if mask_file_meta.get("data_type") != "png" or cached_mask.shape != (
+                    output_camera.height,
+                    output_camera.width,
+                ):
+                    self._logger.info(f"Cached mask {mask_path} has stale format or dimensions; regenerating.")
+                    output_cache.clear_current_folder()
+                    regenerate_cache = True
+                    break
+                _, raw_cached_mask = output_cache.read_file(cache_mask_filename)
+                if not np.array_equal(raw_cached_mask, encode_binary_mask(cached_mask, "png")):
+                    self._logger.info(
+                        f"Cached mask {mask_path} does not use canonical 0/255 PNG encoding; regenerating."
+                    )
+                    output_cache.clear_current_folder()
+                    regenerate_cache = True
+                    break
 
             new_image_metadata.append(
                 SfmPosedImageMetadata(
@@ -238,41 +314,34 @@ class DownsampleImages(BaseTransform):
                     },
                 )
 
-                mask_path = str(image_meta.mask_path)
-                if len(mask_path) > 0 and os.path.exists(mask_path):
-                    full_res_mask_path = mask_path
-                    full_res_mask = cv2.imread(full_res_mask_path)
-                    assert full_res_mask is not None, f"Failed to load mask {full_res_mask_path}"
-                    mask_h, mask_w = full_res_mask.shape[:2]
-                    rescaled_mask_h = int(mask_h / self._image_downsample_factor)
-                    rescaled_mask_w = int(mask_w / self._image_downsample_factor)
-                    assert (
-                        rescaled_mask_w == new_camera_metadata[image_meta.camera_id].width
-                    ), f"Got mismatched mask widths {rescaled_mask_w} != {new_camera_metadata[image_meta.camera_id].width}"
-                    assert (
-                        rescaled_mask_h == new_camera_metadata[image_meta.camera_id].height
-                    ), f"Got mismatched mask heights {rescaled_mask_h} != {new_camera_metadata[image_meta.camera_id].height}"
+                mask_path = ""
+                if mask_path_is_declared(image_meta.mask_path):
+                    full_res_mask = load_binary_mask(image_meta.mask_path)
+                    if full_res_mask.shape != (img_h, img_w):
+                        raise ValueError(
+                            f"Mask shape {full_res_mask.shape} does not match source image shape {(img_h, img_w)} "
+                            f"for image {image_meta.image_id}: {image_meta.mask_path}"
+                        )
                     pbar.set_description(
-                        f"Rescaling {image_filename} from {mask_w} x {mask_h} to {rescaled_mask_w} x {rescaled_mask_h}"
+                        f"Rescaling mask for {image_filename} from {img_w} x {img_h} "
+                        f"to {rescaled_img_w} x {rescaled_img_h}"
                     )
-                    rescaled_mask = cv2.resize(
-                        full_res_mask, (rescaled_mask_w, rescaled_mask_h), interpolation=cv2.INTER_NEAREST_EXACT
+                    rescaled_mask = (
+                        cv2.resize(
+                            full_res_mask.astype(np.uint8),
+                            (rescaled_img_w, rescaled_img_h),
+                            interpolation=cv2.INTER_NEAREST_EXACT,
+                        )
+                        > 0
                     )
-                    assert (
-                        rescaled_mask.shape[0] == rescaled_img_h and rescaled_mask.shape[1] == rescaled_img_w
-                    ), f"Rescaled mask {image_filename} has shape {rescaled_mask.shape} but expected {rescaled_img_h, rescaled_img_w}"
-                    # Save the rescaled image to the cache
                     cache_mask_filename = f"mask_{image_meta.image_id:0{num_zeropad}}"
                     cache_mask_meta = output_cache.write_file(
                         name=cache_mask_filename,
-                        data=rescaled_mask,
+                        data=encode_binary_mask(rescaled_mask, "png"),
                         data_type="png",
                         metadata={"downsample_mode": cv2.INTER_NEAREST_EXACT},
                     )
                     mask_path = str(cache_mask_meta["path"])
-
-                else:
-                    mask_path = ""
 
                 new_image_metadata.append(
                     SfmPosedImageMetadata(
@@ -288,6 +357,11 @@ class DownsampleImages(BaseTransform):
                 )
 
             pbar.close()
+            output_cache.write_file(
+                _DOWNSAMPLE_CACHE_MANIFEST_FILE,
+                expected_manifest,
+                data_type="pt",
+            )
 
             self._logger.info(
                 f"Rescaled {input_scene.num_images} images by a factor of {self._image_downsample_factor} "

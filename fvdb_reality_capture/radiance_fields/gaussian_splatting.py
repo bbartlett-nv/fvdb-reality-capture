@@ -49,6 +49,27 @@ def _pixel_mask_to_tile_mask(pixel_mask: torch.Tensor, tile_size: int) -> torch.
     )
 
 
+def _tile_mask_to_summed_area_table(tile_mask: torch.Tensor) -> torch.Tensor:
+    """Build a padded int32 summed-area table for a boolean mask [C, tileH, tileW]."""
+    if tile_mask.ndim != 3:
+        raise ValueError(f"gradient accumulation tile mask must have shape [C, tileH, tileW], got {tile_mask.shape}")
+    if tile_mask.dtype != torch.bool:
+        raise TypeError(f"gradient accumulation tile mask must have dtype torch.bool, got {tile_mask.dtype}")
+    if not tile_mask.is_contiguous():
+        tile_mask = tile_mask.contiguous()
+
+    values = tile_mask.to(dtype=torch.int32)
+    values = torch.cumsum(values, dim=-2, dtype=torch.int32)
+    values = torch.cumsum(values, dim=-1, dtype=torch.int32)
+    summed_area_table = torch.zeros(
+        (*tile_mask.shape[:-2], tile_mask.shape[-2] + 1, tile_mask.shape[-1] + 1),
+        dtype=torch.int32,
+        device=tile_mask.device,
+    )
+    summed_area_table[..., 1:, 1:] = values
+    return summed_area_table.contiguous()
+
+
 def _apply_pixel_mask(
     features: torch.Tensor,
     alphas: torch.Tensor,
@@ -1475,6 +1496,8 @@ class GaussianSplat3d:
         camera_model: CameraModel,
         projection_method: ProjectionMethod,
         distortion_coeffs: torch.Tensor | None,
+        gradient_accumulation_tile_mask: torch.Tensor | None = None,
+        gradient_accumulation_tile_size: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Project Gaussians onto image planes.
 
@@ -1495,6 +1518,26 @@ class GaussianSplat3d:
                 raise RuntimeError(f"distortionCoeffs must have shape ({C}, 12)")
             if not distortion_coeffs.is_contiguous():
                 raise RuntimeError("distortionCoeffs must be contiguous")
+
+        accumulation_tile_summed_area_table: torch.Tensor | None = None
+        if gradient_accumulation_tile_mask is not None:
+            if gradient_accumulation_tile_size <= 0:
+                raise ValueError("gradient_accumulation_tile_size must be positive when a tile mask is provided")
+            expected_shape = (
+                C,
+                math.ceil(H / gradient_accumulation_tile_size),
+                math.ceil(W / gradient_accumulation_tile_size),
+            )
+            if tuple(gradient_accumulation_tile_mask.shape) != expected_shape:
+                raise ValueError(
+                    "gradient accumulation tile mask must have shape "
+                    f"{expected_shape} for image size {(H, W)}, got {tuple(gradient_accumulation_tile_mask.shape)}"
+                )
+            if gradient_accumulation_tile_mask.device != means.device:
+                raise ValueError(
+                    "gradient accumulation tile mask must be on the same device as the Gaussian parameters"
+                )
+            accumulation_tile_summed_area_table = _tile_mask_to_summed_area_table(gradient_accumulation_tile_mask)
 
         is_opencv = camera_model not in (CameraModel.PINHOLE, CameraModel.ORTHOGRAPHIC)
         if is_opencv:
@@ -1530,6 +1573,8 @@ class GaussianSplat3d:
             accum_max_radii = mr
 
         if self._use_ut(camera_model, projection_method):
+            if accumulation_tile_summed_area_table is not None:
+                raise ValueError("mask-aware gradient accumulation is supported only by analytic projection")
             if distortion_coeffs is None:
                 distortion_coeffs = torch.empty(C, 0, device=means.device, dtype=means.dtype)
             result = _C.project_gaussians_unscented_fwd(
@@ -1571,6 +1616,8 @@ class GaussianSplat3d:
             accum_grad_norms,
             accum_step_counts,
             accum_max_radii,
+            accumulation_tile_summed_area_table,
+            gradient_accumulation_tile_size,
         )
         radii = result[0]
         means2d = result[1]
@@ -2132,6 +2179,8 @@ class GaussianSplat3d:
         min_radius_2d: float = 0.0,
         eps_2d: float = 0.3,
         antialias: bool = False,
+        gradient_accumulation_tile_mask: torch.Tensor | None = None,
+        gradient_accumulation_tile_size: int = 0,
     ) -> ProjectedGaussianSplats:
         """
         Projects this :class:`GaussianSplat3d` onto one or more image planes for rendering multi-channel (see :attr:`num_channels`) images in those planes.
@@ -2220,6 +2269,8 @@ class GaussianSplat3d:
             camera_model,
             projection_method,
             distortion_coeffs,
+            gradient_accumulation_tile_mask,
+            gradient_accumulation_tile_size,
         )
         C = world_to_camera_matrices.size(0)
         render_features = self._eval_sh(world_to_camera_matrices, radii, sh_degree_to_use)
@@ -2260,6 +2311,8 @@ class GaussianSplat3d:
         min_radius_2d: float = 0.0,
         eps_2d: float = 0.3,
         antialias: bool = False,
+        gradient_accumulation_tile_mask: torch.Tensor | None = None,
+        gradient_accumulation_tile_size: int = 0,
     ) -> ProjectedGaussianSplats:
         """
         Projects this :class:`GaussianSplat3d` onto one or more image planes for rendering multi-channel (see :attr:`num_channels`) images with depths
@@ -2354,6 +2407,8 @@ class GaussianSplat3d:
             camera_model,
             projection_method,
             distortion_coeffs,
+            gradient_accumulation_tile_mask,
+            gradient_accumulation_tile_size,
         )
         C = world_to_camera_matrices.size(0)
         render_features = self._make_render_features(

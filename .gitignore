@@ -1,3 +1,5 @@
+containers/
+
 # Generated version file
 fvdb/version.py
 
@@ -78,3 +80,6 @@ tests/data/
 *.h264
 *.mp4
 *.ipynb_checkpoints
+
+# Locally staged container images
+/artifacts/containers/*.sqsh

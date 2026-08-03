@@ -142,16 +142,16 @@ class GaussianSplatDatasetTests(unittest.TestCase):
 
         self.assertAlmostEqual(float(camera_metadata.distortion_coeffs[0]), 0.1)
 
-    def test_off_mode_preserves_legacy_zero_one_mask_threshold(self):
+    def test_all_modes_share_zero_one_mask_threshold(self):
         mask = np.ones((32, 48), dtype=np.bool_)
         scene, _, _ = self._make_masked_scene(mask)
         self.assertTrue(cv2.imwrite(scene.images[0].mask_path, np.ones(mask.shape, dtype=np.uint8)))
 
-        legacy_datum = SfmDataset(scene, mask_rasterization_mode="off")[0]
-        optimized_datum = SfmDataset(scene, mask_rasterization_mode="bbox")[0]
+        off_datum = SfmDataset(scene, mask_rasterization_mode="off")[0]
+        bbox_datum = SfmDataset(scene, mask_rasterization_mode="bbox")[0]
 
-        self.assertFalse(np.any(legacy_datum["mask"]))
-        self.assertTrue(np.all(optimized_datum["mask"]))
+        self.assertTrue(np.all(off_datum["mask"]))
+        self.assertTrue(np.all(bbox_datum["mask"]))
 
     def test_optimized_mask_loader_uses_dtype_appropriate_thresholds(self):
         float_path = self.root / "float_mask.npy"
@@ -165,7 +165,16 @@ class GaussianSplatDatasetTests(unittest.TestCase):
         np.testing.assert_array_equal(_load_binary_mask(str(integer_path)), np.array([[False, True]]))
         np.testing.assert_array_equal(_load_binary_mask(str(byte_path)), np.array([[False, False, True, True]]))
 
-    def test_off_mode_preserves_legacy_npy_mask_rejection(self):
+    def test_canonical_mask_loader_rejects_ambiguous_multichannel_masks(self):
+        ambiguous_path = self.root / "ambiguous.png"
+        ambiguous = np.zeros((4, 5, 3), dtype=np.uint8)
+        ambiguous[1, 2, 0] = 255
+        self.assertTrue(cv2.imwrite(str(ambiguous_path), ambiguous))
+
+        with self.assertRaisesRegex(ValueError, "Ambiguous multi-channel mask"):
+            _load_binary_mask(str(ambiguous_path))
+
+    def test_all_modes_support_bool_npy_masks(self):
         mask = np.ones((32, 48), dtype=np.bool_)
         scene, _, _ = self._make_masked_scene(mask)
         npy_mask_path = self.root / "mask.npy"
@@ -183,10 +192,10 @@ class GaussianSplatDatasetTests(unittest.TestCase):
         )
         scene = scene.replace(images=[npy_metadata])
 
-        with self.assertRaisesRegex(AssertionError, "Failed to load mask"):
-            SfmDataset(scene, mask_rasterization_mode="off")[0]
-        optimized_datum = SfmDataset(scene, mask_rasterization_mode="bbox")[0]
-        self.assertTrue(np.all(optimized_datum["mask"]))
+        off_datum = SfmDataset(scene, mask_rasterization_mode="off")[0]
+        bbox_datum = SfmDataset(scene, mask_rasterization_mode="bbox")[0]
+        self.assertTrue(np.all(off_datum["mask"]))
+        self.assertTrue(np.all(bbox_datum["mask"]))
 
     def test_aligned_mask_crop_adds_ten_pixel_context_and_aligns_outward(self):
         mask = np.zeros((100, 120), dtype=np.bool_)
@@ -236,7 +245,7 @@ class GaussianSplatDatasetTests(unittest.TestCase):
         np.testing.assert_allclose(datum["projection"].numpy(), camera_metadata.projection_matrix)
         self.assertNotIn("raster_tile_mask", datum)
 
-    def test_bbox_mode_prefers_persistent_crop_mask_bbox_attribute(self):
+    def test_bbox_mode_validates_persistent_crop_mask_bbox_attribute(self):
         mask = np.zeros((100, 120), dtype=np.bool_)
         mask[30:37, 35:42] = True
         scene, _, _ = self._make_masked_scene(mask)
@@ -248,48 +257,32 @@ class GaussianSplatDatasetTests(unittest.TestCase):
             }
         )
 
-        with (
-            mock.patch(
-                "fvdb_reality_capture.radiance_fields.gaussian_splat_dataset._load_binary_mask",
-                side_effect=AssertionError("persistent metadata fast path should not decode the mask"),
-            ),
-            mock.patch(
-                "fvdb_reality_capture.radiance_fields.gaussian_splat_dataset._raw_mask_bbox",
-                side_effect=AssertionError("mask scan fallback should not run"),
-            ),
-        ):
+        with mock.patch(
+            "fvdb_reality_capture.radiance_fields.gaussian_splat_dataset.load_binary_mask",
+            wraps=_load_binary_mask,
+        ) as load_mask:
             dataset = SfmDataset(scene, mask_rasterization_mode="bbox")
+        load_mask.assert_called_once_with(scene.images[0].mask_path)
         datum = dataset[0]
 
         np.testing.assert_array_equal(datum["raster_crop"], np.array([16, 16, 48, 32]))
 
-    def test_bbox_mode_emits_minimal_zero_weight_crop_for_empty_persistent_mask(self):
+    def test_bbox_mode_rejects_all_empty_persistent_masks(self):
         mask = np.zeros((32, 48), dtype=np.bool_)
-        scene, _, source_image = self._make_masked_scene(mask)
+        scene, _, _ = self._make_masked_scene(mask)
         scene = scene.with_attributes(
             **{CROP_MASK_BBOX_ATTRIBUTE: PerImageValueAttribute([np.array([0, 0, 0, 0, 0], dtype=np.int64)])}
         )
 
-        datum = SfmDataset(scene, mask_rasterization_mode="bbox")[0]
+        with self.assertRaisesRegex(ValueError, "no images with a valid mask"):
+            SfmDataset(scene, mask_rasterization_mode="bbox")
 
-        np.testing.assert_array_equal(datum["raster_crop"], np.array([0, 0, 16, 16]))
-        np.testing.assert_array_equal(datum["full_image_size"], np.array([32, 48]))
-        np.testing.assert_array_equal(datum["image"], source_image[:16, :16])
-        self.assertEqual(datum["mask"].shape, (16, 16))
-        self.assertFalse(np.any(datum["mask"]))
-        self.assertEqual(float(datum["image_loss_scale"]), 0.0)
-        self.assertNotIn("raster_tile_mask", datum)
-
-    def test_bbox_mode_emits_sensor_clipped_zero_weight_crop_for_empty_mask_fallback(self):
+    def test_bbox_mode_rejects_all_empty_masks_without_bbox_metadata(self):
         mask = np.zeros((7, 9), dtype=np.bool_)
-        scene, _, source_image = self._make_masked_scene(mask)
+        scene, _, _ = self._make_masked_scene(mask)
 
-        datum = SfmDataset(scene, mask_rasterization_mode="bbox")[0]
-
-        np.testing.assert_array_equal(datum["raster_crop"], np.array([0, 0, 9, 7]))
-        np.testing.assert_array_equal(datum["image"], source_image)
-        np.testing.assert_array_equal(datum["mask"], mask)
-        self.assertEqual(float(datum["image_loss_scale"]), 0.0)
+        with self.assertRaisesRegex(ValueError, "no images with a valid mask"):
+            SfmDataset(scene, mask_rasterization_mode="bbox")
 
     def test_bbox_mode_validates_persistent_bbox_bounds_and_count(self):
         mask = np.ones((32, 48), dtype=np.bool_)
@@ -308,13 +301,13 @@ class GaussianSplatDatasetTests(unittest.TestCase):
         invalid_count = scene.with_attributes(
             **{CROP_MASK_BBOX_ATTRIBUTE: PerImageValueAttribute([np.array([10, 10, 12, 12, 5], dtype=np.int64)])}
         )
-        with self.assertRaisesRegex(ValueError, "exceeds raw bbox area"):
+        with self.assertRaisesRegex(ValueError, "Stale or invalid"):
             SfmDataset(invalid_count, mask_rasterization_mode="bbox")
 
         invalid_empty_bounds = scene.with_attributes(
             **{CROP_MASK_BBOX_ATTRIBUTE: PerImageValueAttribute([np.array([0, 0, 1, 1, 0], dtype=np.int64)])}
         )
-        with self.assertRaisesRegex(ValueError, "for an empty mask"):
+        with self.assertRaisesRegex(ValueError, "Stale or invalid"):
             SfmDataset(invalid_empty_bounds, mask_rasterization_mode="bbox")
 
     def test_bbox_mode_metadata_collates_for_batch_size_one(self):
@@ -357,19 +350,101 @@ class GaussianSplatDatasetTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires a mask"):
             SfmDataset(scene, mask_rasterization_mode="bbox")
 
-    def test_tiles_mode_emits_full_frame_zero_weight_tiles_for_empty_mask(self):
+    def test_tiles_mode_rejects_all_empty_masks(self):
         mask = np.zeros((32, 48), dtype=np.bool_)
-        scene, _, source_image = self._make_masked_scene(mask)
+        scene, _, _ = self._make_masked_scene(mask)
 
-        datum = SfmDataset(scene, mask_rasterization_mode="tiles")[0]
+        with self.assertRaisesRegex(ValueError, "no images with a valid mask"):
+            SfmDataset(scene, mask_rasterization_mode="tiles")
 
-        np.testing.assert_array_equal(datum["image"], source_image)
-        np.testing.assert_array_equal(datum["mask"], mask)
-        np.testing.assert_array_equal(datum["raster_crop"], np.array([0, 0, 48, 32]))
-        np.testing.assert_array_equal(datum["full_image_size"], np.array([32, 48]))
-        self.assertEqual(datum["raster_tile_mask"].shape, (2, 3))
-        self.assertFalse(np.any(datum["raster_tile_mask"]))
-        self.assertEqual(float(datum["image_loss_scale"]), 0.0)
+    def test_mask_aware_dataset_filters_empty_and_optional_small_masks(self):
+        valid_mask = np.zeros((32, 48), dtype=np.bool_)
+        valid_mask[4:20, 5:25] = True
+        scene, _, _ = self._make_masked_scene(valid_mask)
+        source_metadata = scene.images[0]
+
+        empty_path = self.root / "empty_mask.png"
+        tiny_path = self.root / "tiny_mask.png"
+        self.assertTrue(cv2.imwrite(str(empty_path), np.zeros(valid_mask.shape, dtype=np.uint8)))
+        tiny_mask = np.zeros(valid_mask.shape, dtype=np.uint8)
+        tiny_mask[0, 0] = 255
+        self.assertTrue(cv2.imwrite(str(tiny_path), tiny_mask))
+
+        def metadata(mask_path: str | pathlib.Path, image_id: int) -> SfmPosedImageMetadata:
+            return SfmPosedImageMetadata(
+                world_to_camera_matrix=source_metadata.world_to_camera_matrix,
+                camera_to_world_matrix=source_metadata.camera_to_world_matrix,
+                camera_metadata=source_metadata.camera_metadata,
+                camera_id=source_metadata.camera_id,
+                image_path=source_metadata.image_path,
+                mask_path=str(mask_path),
+                point_indices=source_metadata.point_indices,
+                image_id=image_id,
+            )
+
+        scene = scene.replace(
+            images=[
+                metadata(empty_path, 10),
+                metadata(tiny_path, 11),
+                metadata(pathlib.Path(source_metadata.mask_path), 12),
+            ]
+        )
+
+        default_dataset = SfmDataset(scene, mask_rasterization_mode="tiles")
+        threshold_dataset = SfmDataset(
+            scene,
+            mask_rasterization_mode="bbox",
+            minimum_valid_mask_area=0.01,
+        )
+
+        np.testing.assert_array_equal(default_dataset.indices, np.array([1, 2]))
+        np.testing.assert_array_equal(threshold_dataset.indices, np.array([2]))
+
+        off_scene = scene.replace(images=[metadata("", 9), *scene.images])
+        off_dataset = SfmDataset(
+            off_scene,
+            filter_empty_masks=True,
+            minimum_valid_mask_area=0.01,
+        )
+        np.testing.assert_array_equal(off_dataset.indices, np.array([0, 3]))
+        self.assertNotIn("mask", off_dataset[0])
+        self.assertTrue(np.any(off_dataset[1]["mask"]))
+
+    def test_off_mode_empty_mask_filtering_is_opt_in(self):
+        mask = np.zeros((32, 48), dtype=np.bool_)
+        scene, _, _ = self._make_masked_scene(mask)
+
+        unfiltered_dataset = SfmDataset(scene)
+        self.assertEqual(len(unfiltered_dataset), 1)
+        self.assertFalse(np.any(unfiltered_dataset[0]["mask"]))
+        with self.assertRaisesRegex(ValueError, "no images with a valid mask"):
+            SfmDataset(scene, filter_empty_masks=True)
+
+        empty_validation_dataset = SfmDataset(
+            scene,
+            filter_empty_masks=True,
+            allow_empty_after_filtering=True,
+        )
+        self.assertEqual(len(empty_validation_dataset), 0)
+        np.testing.assert_array_equal(empty_validation_dataset.indices, np.array([], dtype=np.int64))
+
+    def test_minimum_valid_mask_area_can_filter_every_image(self):
+        mask = np.zeros((32, 48), dtype=np.bool_)
+        mask[0, 0] = True
+        scene, _, _ = self._make_masked_scene(mask)
+
+        with self.assertRaisesRegex(ValueError, "no images with a valid mask"):
+            SfmDataset(
+                scene,
+                filter_empty_masks=True,
+                minimum_valid_mask_area=0.01,
+            )
+        with self.assertRaisesRegex(ValueError, "no images with a valid mask"):
+            SfmDataset(
+                scene,
+                mask_rasterization_mode="bbox",
+                minimum_valid_mask_area=0.01,
+            )
 
     def test_mask_rasterization_mode_rejects_mask_shape_mismatch(self):
         mask = np.ones((32, 48), dtype=np.bool_)
@@ -393,3 +468,11 @@ class GaussianSplatDatasetTests(unittest.TestCase):
             SfmDataset(scene, patch_size=4, mask_rasterization_mode="bbox")
         with self.assertRaisesRegex(ValueError, "return_visible_points is not supported"):
             SfmDataset(scene, return_visible_points=True, mask_rasterization_mode="bbox")
+        with self.assertRaisesRegex(ValueError, "requires filter_empty_masks"):
+            SfmDataset(scene, minimum_valid_mask_area=0.1)
+        with self.assertRaisesRegex(ValueError, "filter_empty_masks must be a bool"):
+            SfmDataset(scene, filter_empty_masks=1)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ValueError, "allow_empty_after_filtering must be a bool"):
+            SfmDataset(scene, allow_empty_after_filtering=1)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ValueError, "finite fraction"):
+            SfmDataset(scene, mask_rasterization_mode="tiles", minimum_valid_mask_area=1.1)

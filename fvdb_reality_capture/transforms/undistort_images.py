@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 import logging
-import os
 import pathlib
 from typing import Any, Literal
 
@@ -10,10 +9,22 @@ import cv2
 import numpy as np
 import tqdm
 
+from fvdb_reality_capture.mask_utils import (
+    build_scene_cache_fingerprint,
+    cache_fingerprint_matches,
+    encode_binary_mask,
+    load_binary_mask,
+    mask_path_is_declared,
+)
 from fvdb_reality_capture.sfm_scene import SfmCache, SfmCameraMetadata, SfmPosedImageMetadata, SfmScene
 
 from ..enums import CameraModel
 from .base_transform import BaseTransform, transform
+
+_UNDISTORT_CACHE_MANIFEST_VERSION = 1
+_UNDISTORT_CACHE_MANIFEST_FILE = "manifest"
+_UNDISTORT_CACHE_FINGERPRINT_KEY = "fingerprint"
+_UNDISTORT_ALGORITHM_VERSION = 1
 
 
 @transform
@@ -193,23 +204,71 @@ class UndistortImages(BaseTransform):
             for cam_id, camera_meta in input_scene.cameras.items()
         }
 
-        num_zeropad = len(str(len(input_scene.images))) + 2
-        num_masks = sum(
-            len(str(image_meta.mask_path)) > 0 and os.path.exists(image_meta.mask_path)
-            for image_meta in input_scene.images
+        expected_fingerprint = build_scene_cache_fingerprint(
+            input_scene,
+            algorithm="undistort_images",
+            algorithm_version=_UNDISTORT_ALGORITHM_VERSION,
+            settings={
+                "image_type": self._image_type,
+                "jpeg_quality": self._jpeg_quality,
+                "alpha": self._alpha,
+                "remap_interpolation": self._remap_interpolation,
+                "mask_interpolation": self._mask_interpolation,
+                "mask_format": "png",
+            },
+            include_source_images=True,
         )
+        expected_manifest = {
+            "version": _UNDISTORT_CACHE_MANIFEST_VERSION,
+            _UNDISTORT_CACHE_FINGERPRINT_KEY: expected_fingerprint,
+        }
+        source_masks: list[np.ndarray | None] = []
+        for scene_index, image_meta in enumerate(input_scene.images):
+            if not mask_path_is_declared(image_meta.mask_path):
+                source_masks.append(None)
+                continue
+            mask = load_binary_mask(image_meta.mask_path)
+            expected_shape = (image_meta.camera_metadata.height, image_meta.camera_metadata.width)
+            if mask.shape != expected_shape:
+                raise ValueError(
+                    f"Mask shape {mask.shape} does not match camera image size {expected_shape} for scene index "
+                    f"{scene_index}: {image_meta.mask_path}"
+                )
+            source_masks.append(mask)
+
+        num_zeropad = len(str(len(input_scene.images))) + 2
+        num_masks = sum(mask is not None for mask in source_masks)
 
         regenerate_cache = False
-        if output_cache.num_files != input_scene.num_images + num_masks:
+        if output_cache.num_files != input_scene.num_images + num_masks + 1:
             if output_cache.num_files == 0:
                 self._logger.info("No undistorted images found in the cache.")
             else:
                 self._logger.info(
-                    f"Inconsistent number of undistorted files in the cache. Expected {input_scene.num_images + num_masks}, "
+                    f"Inconsistent number of undistorted files in the cache. Expected {input_scene.num_images + num_masks + 1}, "
                     f"found {output_cache.num_files}. Clearing cache and regenerating undistorted images."
                 )
             output_cache.clear_current_folder()
             regenerate_cache = True
+        if not regenerate_cache:
+            if not output_cache.has_file(_UNDISTORT_CACHE_MANIFEST_FILE):
+                self._logger.info("Undistort cache has no versioned manifest; regenerating legacy cache.")
+                output_cache.clear_current_folder()
+                regenerate_cache = True
+            else:
+                _, cached_manifest = output_cache.read_file(_UNDISTORT_CACHE_MANIFEST_FILE)
+                manifest_matches = (
+                    isinstance(cached_manifest, dict)
+                    and cached_manifest.get("version") == _UNDISTORT_CACHE_MANIFEST_VERSION
+                    and cache_fingerprint_matches(
+                        cached_manifest.get(_UNDISTORT_CACHE_FINGERPRINT_KEY),
+                        expected_fingerprint,
+                    )
+                )
+                if not manifest_matches:
+                    self._logger.info("Undistort cache manifest is malformed or stale; regenerating cache.")
+                    output_cache.clear_current_folder()
+                    regenerate_cache = True
 
         new_image_metadata: list[SfmPosedImageMetadata] = []
         for image_id in range(input_scene.num_images):
@@ -245,7 +304,7 @@ class UndistortImages(BaseTransform):
                 break
 
             mask_path = ""
-            if len(str(image_meta.mask_path)) > 0 and os.path.exists(image_meta.mask_path):
+            if source_masks[image_id] is not None:
                 cache_mask_filename = f"mask_{image_meta.image_id:0{num_zeropad}}"
                 if not output_cache.has_file(cache_mask_filename):
                     self._logger.info(
@@ -255,6 +314,35 @@ class UndistortImages(BaseTransform):
                     regenerate_cache = True
                     break
                 mask_file_meta = output_cache.get_file_metadata(cache_mask_filename)
+                mask_value_meta = mask_file_meta["metadata"]
+                if (
+                    mask_file_meta.get("data_type", "") != "png"
+                    or mask_value_meta.get("remap_interpolation", -1) != self._mask_interpolation
+                    or mask_value_meta.get("alpha", None) != self._alpha
+                ):
+                    self._logger.info(
+                        "Output cache mask metadata does not match expected format. Clearing the cache and regenerating."
+                    )
+                    output_cache.clear_current_folder()
+                    regenerate_cache = True
+                    break
+                cached_mask = load_binary_mask(mask_file_meta["path"])
+                output_camera = new_camera_metadata[image_meta.camera_id][0]
+                if cached_mask.shape != (output_camera.height, output_camera.width):
+                    self._logger.info(
+                        "Cached mask shape does not match the undistorted camera. Clearing the cache and regenerating."
+                    )
+                    output_cache.clear_current_folder()
+                    regenerate_cache = True
+                    break
+                _, raw_cached_mask = output_cache.read_file(cache_mask_filename)
+                if not np.array_equal(raw_cached_mask, encode_binary_mask(cached_mask, "png")):
+                    self._logger.info(
+                        "Cached mask does not use canonical 0/255 PNG encoding. Clearing the cache and regenerating."
+                    )
+                    output_cache.clear_current_folder()
+                    regenerate_cache = True
+                    break
                 mask_path = str(mask_file_meta["path"])
 
             new_image_metadata.append(
@@ -273,7 +361,7 @@ class UndistortImages(BaseTransform):
         if regenerate_cache:
             new_image_metadata = []
             pbar = tqdm.tqdm(input_scene.images, unit="imgs", desc="Undistorting images")
-            for image_meta in pbar:
+            for scene_index, image_meta in enumerate(pbar):
                 image_filename = pathlib.Path(image_meta.image_path).name
                 image = cv2.imread(image_meta.image_path, cv2.IMREAD_UNCHANGED)
                 assert image is not None, f"Failed to load image {image_meta.image_path}"
@@ -299,16 +387,19 @@ class UndistortImages(BaseTransform):
                 )
 
                 mask_path = ""
-                if len(str(image_meta.mask_path)) > 0 and os.path.exists(image_meta.mask_path):
-                    mask = cv2.imread(image_meta.mask_path, cv2.IMREAD_UNCHANGED)
-                    assert mask is not None, f"Failed to load mask {image_meta.mask_path}"
+                source_mask = source_masks[scene_index]
+                if source_mask is not None:
                     undistorted_mask = self._undistort_and_crop(
-                        mask, undistort_map_x, undistort_map_y, undistort_roi, self._mask_interpolation
+                        source_mask.astype(np.uint8, copy=False),
+                        undistort_map_x,
+                        undistort_map_y,
+                        undistort_roi,
+                        self._mask_interpolation,
                     )
                     cache_mask_filename = f"mask_{image_meta.image_id:0{num_zeropad}}"
                     cache_mask_meta = output_cache.write_file(
                         name=cache_mask_filename,
-                        data=undistorted_mask,
+                        data=encode_binary_mask(undistorted_mask, "png"),
                         data_type="png",
                         metadata={"remap_interpolation": self._mask_interpolation, "alpha": self._alpha},
                     )
@@ -327,6 +418,11 @@ class UndistortImages(BaseTransform):
                     )
                 )
             pbar.close()
+            output_cache.write_file(
+                _UNDISTORT_CACHE_MANIFEST_FILE,
+                expected_manifest,
+                data_type="pt",
+            )
 
         output_scene = SfmScene(
             cameras={cam_id: value[0] for cam_id, value in new_camera_metadata.items()},

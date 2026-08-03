@@ -16,7 +16,7 @@ import torch.nn.functional as nnf
 import torch.utils.data
 from torch.utils import _pytree
 import tqdm
-from fvdb.utils.metrics import psnr, ssim
+from fvdb.utils.metrics import masked_ssim, psnr, ssim
 from fvdb.viz import Scene
 from scipy.spatial import cKDTree  # type: ignore
 
@@ -50,8 +50,18 @@ def _validate_mask_rasterization_config(
     mode = config.mask_rasterization_mode
     if mode not in ("off", "tiles", "bbox"):
         raise ValueError(f"Unknown mask_rasterization_mode {mode!r}; expected one of: off, tiles, bbox.")
+    if not np.isfinite(config.scene_bbox_support_sigma) or config.scene_bbox_support_sigma < 0.0:
+        raise ValueError("scene_bbox_support_sigma must be finite and nonnegative.")
+    if config.minimum_valid_mask_area is not None and not 0.0 <= config.minimum_valid_mask_area <= 1.0:
+        raise ValueError("minimum_valid_mask_area must be a fraction in [0, 1] or None.")
+    if config.minimum_valid_mask_area is not None and config.ignore_masks:
+        raise ValueError("minimum_valid_mask_area cannot be used when ignore_masks=True.")
     if mode == "off":
         return
+    if config.optimize_camera_poses:
+        raise ValueError(
+            "Mask-aware rasterization requires optimize_camera_poses=False because masks are tied to fixed poses."
+        )
 
     if config.render_backend != "image_space":
         raise ValueError("Mask-aware rasterization currently requires render_backend='image_space'.")
@@ -91,6 +101,64 @@ def _masked_ground_truth(
         valid_mask.to(device=ground_truth.device, dtype=torch.bool).unsqueeze(-1).expand_as(ground_truth).contiguous()
     )
     return torch.where(valid_rgb, ground_truth, prediction.detach())
+
+
+def _validate_masked_image_inputs(
+    prediction: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor
+) -> torch.Tensor:
+    """Validate image/mask shapes and move the mask to the image device."""
+    if prediction.shape != target.shape:
+        raise ValueError(f"Prediction and target shapes differ: {prediction.shape} and {target.shape}.")
+    if prediction.ndim != 4:
+        raise ValueError(f"Expected BHWC images, got shape {prediction.shape}.")
+    if valid_mask.shape != prediction.shape[:-1]:
+        raise ValueError(f"Mask shape {valid_mask.shape} does not match image shape {prediction.shape}.")
+    return valid_mask.to(device=prediction.device, dtype=torch.bool)
+
+
+def _masked_l1_losses(
+    prediction: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return full-image- and valid-normalized strict masked L1 losses."""
+    valid = _validate_masked_image_inputs(prediction, target, valid_mask)
+    valid_channels = valid.unsqueeze(-1).expand_as(prediction)
+    zero = prediction.new_zeros(())
+    safe_prediction = torch.where(valid_channels, prediction, zero)
+    safe_target = torch.where(valid_channels, target, zero)
+    absolute_error = torch.abs(safe_prediction - safe_target)
+    full_image_loss = absolute_error.mean()
+    valid_loss = absolute_error.sum() / valid_channels.sum().clamp_min(1)
+    return full_image_loss, valid_loss
+
+
+def _masked_ssim_losses(
+    prediction: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return full-image- and valid-normalized strict masked SSIM losses."""
+    valid = _validate_masked_image_inputs(prediction, target, valid_mask)
+    ssim_map = masked_ssim(
+        prediction.permute(0, 3, 1, 2).contiguous(),
+        target.permute(0, 3, 1, 2).contiguous(),
+        valid.unsqueeze(1),
+        reduction="none",
+    )
+    valid_centers = valid.unsqueeze(1).expand_as(ssim_map)
+    loss_map = torch.where(valid_centers, 1.0 - ssim_map, torch.zeros_like(ssim_map))
+    full_image_loss = loss_map.mean()
+    valid_loss = loss_map.sum() / valid_centers.sum().clamp_min(1)
+    return full_image_loss, valid_loss
+
+
+def _masked_psnr(prediction: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    """Compute valid-pixel PSNR for BHWC images."""
+    valid = _validate_masked_image_inputs(prediction, target, valid_mask)
+    valid_channels = valid.unsqueeze(-1).expand_as(prediction)
+    zero = prediction.new_zeros(())
+    safe_prediction = torch.where(valid_channels, prediction, zero)
+    safe_target = torch.where(valid_channels, target, zero)
+    squared_error = torch.square(safe_prediction - safe_target)
+    mse = squared_error.sum() / valid_channels.sum().clamp_min(1)
+    return -10.0 * torch.log10(mse)
 
 
 def _scale_shift_invariant_l1(
@@ -353,9 +421,20 @@ class GaussianSplatReconstructionConfig:
     Default: ``"off"``
     """
 
+    minimum_valid_mask_area: float | None = None
+    """
+    Optional minimum valid mask coverage, expressed as a fraction of the full sensor area.
+
+    Whenever masks are honored, images with zero valid pixels are filtered in every rasterization mode.
+    Set this value in [0, 1] to filter additional low-coverage masked images, or None to disable
+    thresholding beyond empty masks. This option cannot be combined with ``ignore_masks=True``.
+
+    Default: None
+    """
+
     remove_gaussians_outside_scene_bbox: bool = False
     """
-    If set to ``True``, then Gaussians whose means fall outside the scene bounding box will be removed at the
+    If set to ``True``, Gaussians whose configured support falls outside the scene bounding box will be removed at the
     configured refinement cadence throughout optimization, including after refinement stops. Checkpoints saved after
     refinement stops and the final export are clipped as well.
 
@@ -363,6 +442,15 @@ class GaussianSplatReconstructionConfig:
     """
 
     #
+    scene_bbox_support_sigma: float = 0.0
+    """
+    Sigma extent of each rotated Gaussian ellipsoid that must remain inside the scene bounding box
+    when remove_gaussians_outside_scene_bbox is enabled. Zero preserves center-only clipping;
+    positive values remove Gaussians whose support crosses the boundary.
+
+    Default: 0.0
+    """
+
     # Pose optimization parameters
     #
 
@@ -600,8 +688,21 @@ class GaussianSplatReconstruction:
         _validate_mask_rasterization_config(config)
 
         train_indices, val_indices = cls._make_index_splits(sfm_scene, use_every_n_as_val)
-        train_dataset = SfmDataset(sfm_scene, train_indices)
-        val_dataset = SfmDataset(sfm_scene, val_indices)
+        filter_training_masks = not config.ignore_masks
+        train_dataset = SfmDataset(
+            sfm_scene,
+            train_indices,
+            filter_empty_masks=filter_training_masks,
+            minimum_valid_mask_area=config.minimum_valid_mask_area if filter_training_masks else None,
+        )
+        filter_validation_masks = not config.ignore_masks and len(val_indices) > 0
+        val_dataset = SfmDataset(
+            sfm_scene,
+            val_indices,
+            filter_empty_masks=filter_validation_masks,
+            minimum_valid_mask_area=config.minimum_valid_mask_area if filter_validation_masks else None,
+            allow_empty_after_filtering=True,
+        )
 
         logger.info(
             f"Created training and validation datasets with {len(train_dataset)} training images and {len(val_dataset)} validation images."
@@ -641,8 +742,8 @@ class GaussianSplatReconstruction:
             sfm_scene=sfm_scene,
             optimizer=optimizer,
             config=config,
-            train_indices=train_indices,
-            val_indices=val_indices,
+            train_indices=train_dataset.indices,
+            val_indices=val_dataset.indices,
             pose_adjust_model=pose_adjust_model,
             pose_adjust_optimizer=pose_adjust_optimizer,
             pose_adjust_scheduler=pose_adjust_scheduler,
@@ -749,6 +850,17 @@ class GaussianSplatReconstruction:
         else:
             train_indices = np.array(state_dict["train_indices"], dtype=int)
             val_indices = np.array(state_dict["val_indices"], dtype=int)
+
+        pose_table_train_indices = train_indices
+        filter_training_masks = not config.ignore_masks
+        filtered_training_dataset = SfmDataset(
+            sfm_scene,
+            train_indices,
+            filter_empty_masks=filter_training_masks,
+            minimum_valid_mask_area=config.minimum_valid_mask_area if filter_training_masks else None,
+        )
+        train_indices = filtered_training_dataset.indices
+
         model_state = cls._move_state_tensors_to_device(state_dict["model"], device)
         model = GaussianSplat3d.from_state_dict(model_state)
         optimizer_state = dict(state_dict["optimizer"])
@@ -785,7 +897,9 @@ class GaussianSplatReconstruction:
                 pose_adjust_model.load_state_dict(pose_adjust_model_state)
                 pose_adjust_optimizer.load_state_dict(pose_adjust_optimizer_state)
                 pose_adjust_scheduler.load_state_dict(pose_adjust_scheduler_state)
-            elif pose_embedding_weights.shape[0] == len(train_indices) and num_pose_entries == len(train_indices):
+            elif pose_embedding_weights.shape[0] == len(pose_table_train_indices) and num_pose_entries == len(
+                pose_table_train_indices
+            ):
                 logger.warning(
                     "Loading legacy checkpoint with training-local pose IDs. Remapping pose deltas to scene-global IDs "
                     "and reinitializing pose optimizer state."
@@ -793,7 +907,7 @@ class GaussianSplatReconstruction:
                 with torch.no_grad():
                     pose_adjust_model.pose_embeddings.weight.zero_()
                     pose_adjust_model.pose_embeddings.weight[
-                        torch.as_tensor(train_indices, dtype=torch.long, device=device)
+                        torch.as_tensor(pose_table_train_indices, dtype=torch.long, device=device)
                     ] = pose_embedding_weights.to(device)
             else:
                 raise ValueError(
@@ -881,9 +995,7 @@ class GaussianSplatReconstruction:
 
         _validate_mask_rasterization_config(config, model.num_channels)
         if config.prune_after_refinement_stop and not isinstance(optimizer, GaussianSplatOptimizer):
-            raise ValueError(
-                "prune_after_refinement_stop is supported only by the classic GaussianSplatOptimizer."
-            )
+            raise ValueError("prune_after_refinement_stop is supported only by the classic GaussianSplatOptimizer.")
         self._sfm_scene = sfm_scene
 
         # Resolve dense-depth supervision: which attribute to load. The comparison form
@@ -916,6 +1028,7 @@ class GaussianSplatReconstruction:
             dense_depth_load = [self.config.dense_depth_attribute]
             self._dense_depth_is_relative = attr.scale == DepthScale.RELATIVE
 
+        filter_training_masks = not self.config.ignore_masks
         self._training_dataset = SfmDataset(
             sfm_scene=sfm_scene,
             dataset_indices=train_indices,
@@ -924,8 +1037,17 @@ class GaussianSplatReconstruction:
             mask_rasterization_mode=self.config.mask_rasterization_mode,
             raster_tile_size=self.config.tile_size,
             raster_context_pixels=MASK_RASTERIZATION_CONTEXT_PIXELS,
+            filter_empty_masks=filter_training_masks,
+            minimum_valid_mask_area=self.config.minimum_valid_mask_area if filter_training_masks else None,
         )
-        self._validation_dataset = SfmDataset(sfm_scene=sfm_scene, dataset_indices=val_indices)
+        filter_validation_masks = not self.config.ignore_masks and len(val_indices) > 0
+        self._validation_dataset = SfmDataset(
+            sfm_scene=sfm_scene,
+            dataset_indices=val_indices,
+            filter_empty_masks=filter_validation_masks,
+            minimum_valid_mask_area=self.config.minimum_valid_mask_area if filter_validation_masks else None,
+            allow_empty_after_filtering=True,
+        )
 
         self.device: torch.device = model.device
         self._render_backend.validate_scene_cameras(self._model, self._training_dataset, self._cfg, self.device)
@@ -1291,7 +1413,7 @@ class GaussianSplatReconstruction:
 
     def _clip_gaussians_to_scene_bbox(self) -> None:
         """
-        Remove all Gaussians whose means lie outside the scene bounding box defined in the dataset.
+        Remove Gaussians whose configured support lies outside the dataset scene bounding box.
         """
         bbox = self.training_dataset.scene_bbox
         bbox_min, bbox_max = bbox[:3], bbox[3:]
@@ -1307,11 +1429,21 @@ class GaussianSplatReconstruction:
         num_gaussians_before_clipping = self.model.num_gaussians
         with torch.no_grad():
             points = self.model.means
-            outside_mask = torch.logical_or(points[:, 0] < bbox_min[0], points[:, 0] > bbox_max[0])
-            outside_mask.logical_or_(points[:, 1] < bbox_min[1])
-            outside_mask.logical_or_(points[:, 1] > bbox_max[1])
-            outside_mask.logical_or_(points[:, 2] < bbox_min[2])
-            outside_mask.logical_or_(points[:, 2] > bbox_max[2])
+            support_extent = torch.zeros_like(points)
+            support_sigma = self.config.scene_bbox_support_sigma
+            if support_sigma > 0.0:
+                unit_quats = nnf.normalize(self.model.quats, dim=-1)
+                rotation_matrices = GaussianSplatOptimizer._unit_quats_to_rotation_matrices(unit_quats)
+                scaled_axes = rotation_matrices * self.model.scales.unsqueeze(-2)
+                support_extent = support_sigma * torch.sqrt(torch.sum(torch.square(scaled_axes), dim=-1))
+
+            bbox_min_tensor = torch.as_tensor(bbox_min, device=points.device, dtype=points.dtype)
+            bbox_max_tensor = torch.as_tensor(bbox_max, device=points.device, dtype=points.dtype)
+            support_min = points - support_extent
+            support_max = points + support_extent
+            outside_mask = torch.logical_or(
+                support_min < bbox_min_tensor.unsqueeze(0), support_max > bbox_max_tensor.unsqueeze(0)
+            ).any(dim=-1)
 
         num_outside = int(outside_mask.sum().item())
         if num_outside == 0:
@@ -1534,18 +1666,22 @@ class GaussianSplatReconstruction:
                         bkgd = torch.rand(1, 3, device=self.device)
                         image = image + bkgd * (1.0 - render_outputs.alpha)
 
-                    if mask_pixels is not None:
-                        # Match invalid ground-truth pixels to the detached render before computing image losses.
-                        pixels = _masked_ground_truth(pixels, image, mask_pixels)
-
                     # Image losses
-                    l1loss = nnf.l1_loss(image, pixels)
-                    ssimloss = 1.0 - ssim(
-                        image.permute(0, 3, 1, 2).contiguous(),
-                        pixels.permute(0, 3, 1, 2).contiguous(),
-                    )
+                    if mask_pixels is not None:
+                        l1loss, valid_l1loss = _masked_l1_losses(image, pixels, mask_pixels)
+                        ssimloss, valid_ssimloss = _masked_ssim_losses(image, pixels, mask_pixels)
+                    else:
+                        l1loss = nnf.l1_loss(image, pixels)
+                        ssimloss = 1.0 - ssim(
+                            image.permute(0, 3, 1, 2).contiguous(),
+                            pixels.permute(0, 3, 1, 2).contiguous(),
+                        )
+                        valid_l1loss = l1loss
+                        valid_ssimloss = ssimloss
+
                     l1loss = l1loss * image_loss_scale
                     ssimloss = ssimloss * image_loss_scale
+                    valid_image_loss = torch.lerp(valid_l1loss, valid_ssimloss, self.config.ssim_lambda)
                     loss = torch.lerp(l1loss, ssimloss, self.config.ssim_lambda)  # type: ignore
 
                     # Apply any additional regularization to the model for the given
@@ -1623,9 +1759,7 @@ class GaussianSplatReconstruction:
                 # Refine before the stop step and enforce bbox clipping on the same cadence throughout training.
                 is_refinement_cadence_step = self._global_step % refine_every_step == 0
                 is_after_refinement_start = self._global_step > refine_start_step
-                if is_refinement_cadence_step and (
-                    is_after_refinement_start or self._global_step >= refine_stop_step
-                ):
+                if is_refinement_cadence_step and (is_after_refinement_start or self._global_step >= refine_stop_step):
                     if is_after_refinement_start and self._global_step < refine_stop_step:
                         self.optimizer.refine()
                     elif self.config.prune_after_refinement_stop:
@@ -1671,6 +1805,9 @@ class GaussianSplatReconstruction:
                     self._writer.log_metric(self._global_step, f"{log_tag}/loss", loss.item())
                     self._writer.log_metric(self._global_step, f"{log_tag}/l1loss", l1loss.item())
                     self._writer.log_metric(self._global_step, f"{log_tag}/ssimloss", ssimloss.item())
+                    self._writer.log_metric(self._global_step, f"{log_tag}/l1loss_valid", valid_l1loss.item())
+                    self._writer.log_metric(self._global_step, f"{log_tag}/ssimloss_valid", valid_ssimloss.item())
+                    self._writer.log_metric(self._global_step, f"{log_tag}/image_loss_valid", valid_image_loss.item())
                     self._writer.log_metric(
                         self._global_step,
                         f"{log_tag}/depth_loss",
@@ -1781,7 +1918,7 @@ class GaussianSplatReconstruction:
         else:
             pbar = enumerate(valloader)
         evaluation_time = 0
-        metrics = {"psnr": [], "ssim": [], "lpips": []}
+        metrics = {"psnr": [], "ssim": [], "lpips": [], "psnr_valid": [], "ssim_valid": [], "l1_valid": []}
         for i, data in pbar:
             world_to_cam_matrices = data["world_to_camera"].to(device)
             projection_matrices = data["projection"].to(device)
@@ -1816,9 +1953,22 @@ class GaussianSplatReconstruction:
 
             evaluation_time += time.time() - tic
 
+            valid_psnr = None
+            valid_ssim = None
             if mask_pixels is not None:
-                # Match invalid ground-truth pixels to the detached render before computing metrics.
+                _, valid_l1 = _masked_l1_losses(predicted_image, ground_truth_image, mask_pixels)
+                valid_psnr = _masked_psnr(predicted_image, ground_truth_image, mask_pixels)
+                valid_ssim = masked_ssim(
+                    predicted_image.permute(0, 3, 1, 2).contiguous(),
+                    ground_truth_image.permute(0, 3, 1, 2).contiguous(),
+                    mask_pixels.to(device=device, dtype=torch.bool).unsqueeze(1),
+                    reduction="valid",
+                    train=False,
+                )
+                # Preserve the existing full-image-normalized metric definitions.
                 ground_truth_image = _masked_ground_truth(ground_truth_image, predicted_image, mask_pixels)
+            else:
+                valid_l1 = nnf.l1_loss(predicted_image, ground_truth_image)
 
             # Save images
             self._writer.save_image(self._global_step, f"{log_tag}/predicted_image{i:04d}.jpg", predicted_image)
@@ -1826,20 +1976,34 @@ class GaussianSplatReconstruction:
 
             ground_truth_image = ground_truth_image.permute(0, 3, 1, 2).contiguous()  # [1, 3, H, W]
             predicted_image = predicted_image.permute(0, 3, 1, 2).contiguous()  # [1, 3, H, W]
-            metrics["psnr"].append(psnr(predicted_image, ground_truth_image))
-            metrics["ssim"].append(ssim(predicted_image, ground_truth_image))
+            image_psnr = psnr(predicted_image, ground_truth_image)
+            image_ssim = ssim(predicted_image, ground_truth_image)
+            metrics["psnr"].append(image_psnr)
+            metrics["ssim"].append(image_ssim)
             metrics["lpips"].append(self._lpips(predicted_image, ground_truth_image))
+            metrics["psnr_valid"].append(image_psnr if valid_psnr is None else valid_psnr)
+            metrics["ssim_valid"].append(image_ssim if valid_ssim is None else valid_ssim)
+            metrics["l1_valid"].append(valid_l1)
 
         evaluation_time /= len(valloader)
 
         psnr_mean = torch.stack(metrics["psnr"]).mean()
         ssim_mean = torch.stack(metrics["ssim"]).mean()
         lpips_mean = torch.stack(metrics["lpips"]).mean()
+        psnr_valid_mean = torch.stack(metrics["psnr_valid"]).mean()
+        ssim_valid_mean = torch.stack(metrics["ssim_valid"]).mean()
+        l1_valid_mean = torch.stack(metrics["l1_valid"]).mean()
         self._logger.info(f"Evaluation for stage {log_tag} completed. Average time per image: {evaluation_time:.3f}s")
         self._logger.info(f"PSNR: {psnr_mean.item():.3f}, SSIM: {ssim_mean.item():.4f}, LPIPS: {lpips_mean.item():.3f}")
+        self._logger.info(
+            f"Valid PSNR: {psnr_valid_mean.item():.3f}, SSIM: {ssim_valid_mean.item():.4f}, L1: {l1_valid_mean.item():.5f}"
+        )
 
         self._writer.log_metric(self._global_step, f"{log_tag}/psnr", psnr_mean.item())
         self._writer.log_metric(self._global_step, f"{log_tag}/ssim", ssim_mean.item())
         self._writer.log_metric(self._global_step, f"{log_tag}/lpips", lpips_mean.item())
+        self._writer.log_metric(self._global_step, f"{log_tag}/psnr_valid", psnr_valid_mean.item())
+        self._writer.log_metric(self._global_step, f"{log_tag}/ssim_valid", ssim_valid_mean.item())
+        self._writer.log_metric(self._global_step, f"{log_tag}/l1_valid", l1_valid_mean.item())
         self._writer.log_metric(self._global_step, f"{log_tag}/evaluation_time", evaluation_time)
         self._writer.log_metric(self._global_step, f"{log_tag}/num_gaussians", self.model.num_gaussians)

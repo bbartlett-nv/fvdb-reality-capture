@@ -22,9 +22,11 @@ from fvdb_reality_capture.sfm_scene import (
 from fvdb_reality_capture.sfm_scene.scene_attribute import CROP_MASK_BBOX_ATTRIBUTE
 from fvdb_reality_capture.transforms.crop_scene import (
     CropScene,
+    CropSceneToPoints,
     _MASK_BBOX_IMAGE_IDS_KEY,
     _MASK_BBOX_MANIFEST_VERSION_KEY,
     _mask_bbox_xyxy_count,
+    _project_bbox_mask,
     _rasterize_convex_hull_mask,
 )
 from fvdb_reality_capture.transforms.downsample_images import DownsampleImages
@@ -84,6 +86,29 @@ class CropSceneMaskCacheTests(unittest.TestCase):
             raise AssertionError(f"Unexpected crop-mask attribute type: {type(attribute).__name__}")
         return np.stack(attribute.values)
 
+    @staticmethod
+    def _replace_image_inputs(
+        scene: SfmScene,
+        *,
+        camera_metadata: SfmCameraMetadata | None = None,
+        mask_path: str | None = None,
+    ) -> SfmScene:
+        camera = scene.cameras[1] if camera_metadata is None else camera_metadata
+        images = [
+            SfmPosedImageMetadata(
+                world_to_camera_matrix=image.world_to_camera_matrix,
+                camera_to_world_matrix=image.camera_to_world_matrix,
+                camera_metadata=camera,
+                camera_id=image.camera_id,
+                image_id=image.image_id,
+                image_path=image.image_path,
+                mask_path=image.mask_path if mask_path is None else mask_path,
+                point_indices=image.point_indices,
+            )
+            for image in scene.images
+        ]
+        return scene.replace(cameras={1: camera}, images=images)
+
     def test_mask_bbox_matches_bool_binary_normalized_and_byte_masks(self):
         expected = np.array([2, 1, 5, 4, 2], dtype=np.int64)
         mask = np.zeros((5, 6), dtype=bool)
@@ -94,9 +119,7 @@ class CropSceneMaskCacheTests(unittest.TestCase):
 
         np.testing.assert_array_equal(_mask_bbox_xyxy_count(mask), expected)
         np.testing.assert_array_equal(_mask_bbox_xyxy_count(mask.astype(np.uint8)), expected)
-        np.testing.assert_array_equal(
-            _mask_bbox_xyxy_count(normalized_mask), np.array([4, 3, 5, 4, 1], dtype=np.int64)
-        )
+        np.testing.assert_array_equal(_mask_bbox_xyxy_count(normalized_mask), np.array([4, 3, 5, 4, 1], dtype=np.int64))
         np.testing.assert_array_equal(_mask_bbox_xyxy_count(mask.astype(np.uint8) * 255), expected)
         np.testing.assert_array_equal(
             _mask_bbox_xyxy_count(np.zeros((5, 6), dtype=np.uint8)), np.zeros((5,), dtype=np.int64)
@@ -105,9 +128,7 @@ class CropSceneMaskCacheTests(unittest.TestCase):
         byte_mask = np.zeros((5, 6), dtype=np.uint8)
         byte_mask[0, 0] = 127
         byte_mask[4, 5] = 128
-        np.testing.assert_array_equal(
-            _mask_bbox_xyxy_count(byte_mask), np.array([5, 4, 6, 5, 1], dtype=np.int64)
-        )
+        np.testing.assert_array_equal(_mask_bbox_xyxy_count(byte_mask), np.array([5, 4, 6, 5, 1], dtype=np.int64))
 
     def test_bounded_rasterizer_preserves_closed_half_space_semantics(self):
         hull = ConvexHull(
@@ -162,7 +183,7 @@ class CropSceneMaskCacheTests(unittest.TestCase):
             self.assertIsNotNone(resized_mask)
             self.assertEqual(resized_mask.shape, (12, 16))
 
-    def test_fresh_cache_hit_and_legacy_manifest_upgrade(self):
+    def test_fresh_cache_hit_and_legacy_manifest_invalidation(self):
         scene = self._make_scene()
         transform = CropScene(np.array([-1.0, -1.0, 1.0, 1.0, 1.0, 3.0], dtype=np.float32))
 
@@ -190,16 +211,176 @@ class CropSceneMaskCacheTests(unittest.TestCase):
             data_type="pt",
         )
         with mock.patch(
-            "fvdb_reality_capture.transforms.crop_scene._rasterize_convex_hull_mask",
-            side_effect=AssertionError("legacy cache upgrade rerasterized masks"),
-        ):
-            upgraded_output = transform(scene)
-        np.testing.assert_array_equal(self._attribute_rows(upgraded_output), first_rows)
+            "fvdb_reality_capture.transforms.crop_scene._project_bbox_mask",
+            wraps=_project_bbox_mask,
+        ) as project_bbox:
+            regenerated_output = transform(scene)
+        self.assertEqual(project_bbox.call_count, 2)
+        np.testing.assert_array_equal(self._attribute_rows(regenerated_output), first_rows)
 
-        _, upgraded_manifest = upgraded_output.cache.read_file("transform")
-        self.assertIn(_MASK_BBOX_MANIFEST_VERSION_KEY, upgraded_manifest)
-        np.testing.assert_array_equal(upgraded_manifest[_MASK_BBOX_IMAGE_IDS_KEY], np.array([7, 42]))
-        np.testing.assert_array_equal(upgraded_manifest[CROP_MASK_BBOX_ATTRIBUTE], first_rows)
+        _, regenerated_manifest = regenerated_output.cache.read_file("transform")
+        self.assertIn(_MASK_BBOX_MANIFEST_VERSION_KEY, regenerated_manifest)
+        np.testing.assert_array_equal(regenerated_manifest[_MASK_BBOX_IMAGE_IDS_KEY], np.array([7, 42]))
+        np.testing.assert_array_equal(regenerated_manifest[CROP_MASK_BBOX_ATTRIBUTE], first_rows)
+
+    def test_bbox_projection_handles_inside_behind_near_plane_and_unsupported_cameras(self):
+        scene = self._make_scene()
+        image = scene.images[0]
+
+        inside_mask = _project_bbox_mask(
+            image,
+            np.array([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype=np.float32),
+        )
+        behind_mask = _project_bbox_mask(
+            image,
+            np.array([-1.0, -1.0, -3.0, 1.0, 1.0, -1.0], dtype=np.float32),
+        )
+        crossing_mask = _project_bbox_mask(
+            image,
+            np.array([0.5, -1.0, -1.0, 2.0, 1.0, 1.0], dtype=np.float32),
+        )
+
+        self.assertTrue(np.all(inside_mask))
+        self.assertFalse(np.any(behind_mask))
+        self.assertEqual(crossing_mask.dtype, np.bool_)
+        self.assertEqual(crossing_mask.shape, (24, 32))
+        self.assertTrue(np.any(crossing_mask))
+
+        unsupported_camera = SfmCameraMetadata(
+            img_width=32,
+            img_height=24,
+            fx=8.0,
+            fy=8.0,
+            cx=16.0,
+            cy=12.0,
+            camera_model=CameraModel.OPENCV_RADTAN_5,
+            distortion_coeffs=np.zeros((12,), dtype=np.float32),
+        )
+        unsupported_image = self._replace_image_inputs(scene, camera_metadata=unsupported_camera).images[0]
+        with self.assertRaisesRegex(NotImplementedError, "UndistortImages"):
+            _project_bbox_mask(
+                unsupported_image,
+                np.array([-1.0, -1.0, 1.0, 1.0, 1.0, 3.0], dtype=np.float32),
+            )
+
+    def test_crop_scene_state_restores_mask_settings_and_point_margin_is_total_fraction(self):
+        bbox = np.array([-1.0, -2.0, 1.0, 3.0, 4.0, 8.0], dtype=np.float32)
+        restored = CropScene.from_state_dict(
+            CropScene(bbox, mask_format="npy", composite_with_existing_masks=False).state_dict()
+        )
+        np.testing.assert_array_equal(restored._bbox, bbox)
+        self.assertEqual(restored._mask_format, "npy")
+        self.assertFalse(restored._composite_with_existing_masks)
+
+        scene = self._make_scene().replace(
+            points=np.array([[0.0, 0.0, 1.0], [2.0, 4.0, 7.0]], dtype=np.float32),
+            points_err=np.zeros((2,), dtype=np.float32),
+            points_rgb=np.zeros((2, 3), dtype=np.uint8),
+        )
+        with mock.patch(
+            "fvdb_reality_capture.transforms.crop_scene._crop_scene_to_bbox",
+            return_value=scene,
+        ) as crop_to_bbox:
+            CropSceneToPoints(margin=0.1)(scene)
+
+        passed_bbox = crop_to_bbox.call_args.kwargs["bbox"]
+        np.testing.assert_allclose(
+            passed_bbox,
+            np.array([-0.1, -0.2, 0.7, 2.1, 4.2, 7.3], dtype=np.float32),
+        )
+
+    def test_crop_cache_fingerprints_camera_state_and_validates_decoded_bbox(self):
+        scene = self._make_scene()
+        bbox = np.array([-1.0, -1.0, 1.0, 1.0, 1.0, 3.0], dtype=np.float32)
+        transform = CropScene(bbox)
+        output = transform(scene)
+
+        _, manifest = output.cache.read_file("transform")
+        manifest[CROP_MASK_BBOX_ATTRIBUTE] = np.zeros((2, 5), dtype=np.int64)
+        output.cache.write_file("transform", manifest, data_type="pt")
+        with mock.patch(
+            "fvdb_reality_capture.transforms.crop_scene._project_bbox_mask",
+            wraps=_project_bbox_mask,
+        ) as project_bbox:
+            transform(scene)
+        self.assertEqual(project_bbox.call_count, 2)
+
+        changed_camera = SfmCameraMetadata(
+            img_width=32,
+            img_height=24,
+            fx=9.0,
+            fy=8.0,
+            cx=16.0,
+            cy=12.0,
+            camera_model=CameraModel.PINHOLE,
+            distortion_coeffs=np.zeros((12,), dtype=np.float32),
+        )
+        changed_scene = self._replace_image_inputs(scene, camera_metadata=changed_camera)
+        with mock.patch(
+            "fvdb_reality_capture.transforms.crop_scene._project_bbox_mask",
+            wraps=_project_bbox_mask,
+        ) as project_bbox:
+            transform(changed_scene)
+        self.assertEqual(project_bbox.call_count, 2)
+
+    def test_crop_composites_bool_npy_and_invalidates_when_source_mask_changes(self):
+        scene = self._make_scene()
+        source_mask_path = self.root / "source_mask.npy"
+        source_mask = np.zeros((24, 32), dtype=np.bool_)
+        source_mask[4:20, 6:26] = True
+        np.save(source_mask_path, source_mask)
+        masked_scene = self._replace_image_inputs(scene, mask_path=str(source_mask_path))
+        transform = CropScene(np.array([-1.0, -1.0, 1.0, 1.0, 1.0, 3.0], dtype=np.float32))
+
+        first_output = transform(masked_scene)
+        for image in first_output.images:
+            persisted = cv2.imread(image.mask_path, cv2.IMREAD_UNCHANGED)
+            self.assertIsNotNone(persisted)
+            self.assertTrue(set(np.unique(persisted)).issubset({0, 255}))
+            self.assertFalse(np.any((persisted > 0) & ~source_mask))
+
+        np.save(source_mask_path, np.zeros_like(source_mask))
+        with mock.patch(
+            "fvdb_reality_capture.transforms.crop_scene._project_bbox_mask",
+            wraps=_project_bbox_mask,
+        ) as project_bbox:
+            second_output = transform(masked_scene)
+        self.assertEqual(project_bbox.call_count, 2)
+        for image in second_output.images:
+            persisted = cv2.imread(image.mask_path, cv2.IMREAD_UNCHANGED)
+            self.assertIsNotNone(persisted)
+            self.assertFalse(np.any(persisted))
+
+        missing_scene = self._replace_image_inputs(scene, mask_path=str(self.root / "missing.npy"))
+        with self.assertRaisesRegex(FileNotFoundError, "Declared mask file does not exist"):
+            transform(missing_scene)
+
+    def test_downsample_masks_are_canonical_and_source_content_invalidates_cache(self):
+        scene = self._make_scene()
+        source_mask_path = self.root / "downsample_source.npy"
+        source_mask = np.zeros((24, 32), dtype=np.bool_)
+        source_mask[3:21, 5:27] = True
+        np.save(source_mask_path, source_mask)
+        masked_scene = self._replace_image_inputs(scene, mask_path=str(source_mask_path))
+        transform = DownsampleImages(2, image_type="png")
+
+        first_output = transform(masked_scene)
+        for image in first_output.images:
+            persisted = cv2.imread(image.mask_path, cv2.IMREAD_UNCHANGED)
+            self.assertIsNotNone(persisted)
+            self.assertTrue(set(np.unique(persisted)).issubset({0, 255}))
+            self.assertTrue(np.any(persisted))
+
+        np.save(source_mask_path, np.zeros_like(source_mask))
+        second_output = transform(masked_scene)
+        for image in second_output.images:
+            persisted = cv2.imread(image.mask_path, cv2.IMREAD_UNCHANGED)
+            self.assertIsNotNone(persisted)
+            self.assertFalse(np.any(persisted))
+
+        missing_scene = self._replace_image_inputs(scene, mask_path=str(self.root / "missing_downsample.npy"))
+        with self.assertRaisesRegex(FileNotFoundError, "Declared mask file does not exist"):
+            transform(missing_scene)
 
 
 if __name__ == "__main__":

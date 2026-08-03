@@ -4,7 +4,6 @@
 import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Literal
 
 import cv2
@@ -13,6 +12,12 @@ import torch
 import torch.utils.data
 import torchvision
 
+from fvdb_reality_capture.mask_utils import (
+    bbox_metadata_contains_mask,
+    load_binary_mask,
+    mask_bbox_xyxy_count,
+    mask_path_is_declared,
+)
 from fvdb_reality_capture.sfm_scene import (
     DepthMapAttribute,
     PerImageRasterAttribute,
@@ -36,64 +41,12 @@ class _MaskRasterizationInfo:
     raster_tile_mask: np.ndarray | None = None
 
 
-def _load_legacy_binary_mask(mask_path: str) -> np.ndarray:
-    """Load a mask with the exact pre-ROI dataset format and threshold semantics."""
-    if mask_path.endswith((".jpg", ".jpeg")):
-        img_data = torchvision.io.read_file(mask_path)
-        mask = torchvision.io.decode_jpeg(img_data, device="cpu")[0].numpy()
-    elif mask_path.endswith(".png"):
-        img_data = torchvision.io.read_file(mask_path)
-        mask = torchvision.io.decode_png(img_data)[0].numpy()
-    else:
-        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        assert mask is not None, f"Failed to load mask: {mask_path}"
-    return mask > 127
-
-
-def _load_binary_mask(mask_path: str) -> np.ndarray:
-    """Load a mask as a two-dimensional boolean array."""
-    path = Path(mask_path)
-    if not path.is_file():
-        raise FileNotFoundError(f"Mask file does not exist: {mask_path}")
-
-    suffix = path.suffix.lower()
-    if suffix in (".jpg", ".jpeg"):
-        img_data = torchvision.io.read_file(mask_path)
-        mask = torchvision.io.decode_jpeg(img_data, device="cpu")[0].numpy()
-    elif suffix == ".png":
-        img_data = torchvision.io.read_file(mask_path)
-        mask = torchvision.io.decode_png(img_data)[0].numpy()
-    elif suffix == ".npy":
-        mask = np.load(mask_path)
-    else:
-        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            raise FileNotFoundError(f"Failed to load mask: {mask_path}")
-
-    if mask.ndim != 2:
-        raise ValueError(f"Mask must have shape (H, W); got {mask.shape} from {mask_path}")
-    if mask.dtype == np.bool_:
-        return np.ascontiguousarray(mask)
-    is_normalized = mask.size == 0 or (np.min(mask) >= 0 and np.max(mask) <= 1)
-    if np.issubdtype(mask.dtype, np.floating) and is_normalized:
-        threshold = 0.5
-    elif np.issubdtype(mask.dtype, np.integer) and is_normalized:
-        threshold = 0
-    else:
-        threshold = 127
-    return np.ascontiguousarray(mask > threshold)
+_load_binary_mask = load_binary_mask
 
 
 def _raw_mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int, int]:
     """Return the tight half-open ``(x0, y0, x1, y1, count)`` bounds of a mask."""
-    if mask.ndim != 2:
-        raise ValueError(f"Mask must have shape (H, W); got {mask.shape}")
-    valid_rows = np.flatnonzero(np.any(mask, axis=1))
-    valid_cols = np.flatnonzero(np.any(mask, axis=0))
-    valid_count = int(np.count_nonzero(mask))
-    if valid_count == 0:
-        return 0, 0, 0, 0, 0
-    return int(valid_cols[0]), int(valid_rows[0]), int(valid_cols[-1]) + 1, int(valid_rows[-1]) + 1, valid_count
+    return tuple(int(value) for value in mask_bbox_xyxy_count(mask))
 
 
 def _aligned_bbox_crop(
@@ -190,6 +143,9 @@ class SfmDataset(torch.utils.data.Dataset, Iterable):
         mask_rasterization_mode: MaskRasterizationMode = "off",
         raster_tile_size: int = 16,
         raster_context_pixels: int = 10,
+        filter_empty_masks: bool = False,
+        minimum_valid_mask_area: float | None = None,
+        allow_empty_after_filtering: bool = False,
     ):
         """
         Create a new SfmDataset instance.
@@ -208,6 +164,15 @@ class SfmDataset(torch.utils.data.Dataset, Iterable):
             raster_tile_size: Raster tile size used to align bounding boxes and compact tile masks.
             raster_context_pixels: Pixel context retained around the residual mask. The default of 10 preserves
                 the current full-frame loss semantics for the 11x11 SSIM kernel.
+            filter_empty_masks: If True, exclude images with declared masks containing no valid pixels even when
+                mask-aware rasterization is off. Images without a declared mask remain in the dataset. Empty masks
+                are always excluded when mask-aware rasterization is enabled.
+            minimum_valid_mask_area: Optional minimum fraction of valid mask pixels in [0, 1].
+                Images below this threshold are excluded in mask-aware modes, or in off mode when
+                filter_empty_masks is True. Empty masks are always excluded whenever mask filtering is active.
+            allow_empty_after_filtering: If True, permit mask filtering to remove every selected image.
+                This is intended for optional datasets such as validation splits. The default raises when a
+                nonempty selection contains no usable masked images, which protects training datasets.
         """
         self._logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
 
@@ -228,9 +193,25 @@ class SfmDataset(torch.utils.data.Dataset, Iterable):
             raise ValueError("patch_size is not supported when mask_rasterization_mode is enabled")
         if mask_rasterization_mode == "bbox" and return_visible_points:
             raise ValueError("return_visible_points is not supported with mask_rasterization_mode='bbox'")
+        if not isinstance(filter_empty_masks, bool):
+            raise ValueError(f"filter_empty_masks must be a bool; got {filter_empty_masks!r}")
+        if not isinstance(allow_empty_after_filtering, bool):
+            raise ValueError(f"allow_empty_after_filtering must be a bool; got {allow_empty_after_filtering!r}")
+        if minimum_valid_mask_area is not None:
+            if mask_rasterization_mode == "off" and not filter_empty_masks:
+                raise ValueError(
+                    "minimum_valid_mask_area in off mode requires filter_empty_masks=True so masks are honored"
+                )
+            if not np.isfinite(minimum_valid_mask_area) or not 0.0 <= minimum_valid_mask_area <= 1.0:
+                raise ValueError(
+                    f"minimum_valid_mask_area must be a finite fraction in [0, 1]; got {minimum_valid_mask_area}"
+                )
         self.mask_rasterization_mode: MaskRasterizationMode = mask_rasterization_mode
         self.raster_tile_size = raster_tile_size
         self.raster_context_pixels = raster_context_pixels
+        self.filter_empty_masks = filter_empty_masks
+        self.minimum_valid_mask_area = minimum_valid_mask_area
+        self.allow_empty_after_filtering = allow_empty_after_filtering
 
         _RESERVED_KEYS = {
             "projection",
@@ -288,7 +269,7 @@ class SfmDataset(torch.utils.data.Dataset, Iterable):
 
         self._indices: np.ndarray = dataset_indices
         self._mask_rasterization_info: dict[int, _MaskRasterizationInfo] = {}
-        if self.mask_rasterization_mode != "off":
+        if self.mask_rasterization_mode != "off" or self.filter_empty_masks:
             self._precompute_mask_rasterization_info()
 
     def _precompute_mask_rasterization_info(self) -> None:
@@ -306,10 +287,16 @@ class SfmDataset(torch.utils.data.Dataset, Iterable):
                 )
             bbox_attribute = candidate
 
+        retained_indices: list[int] = []
+        empty_mask_count = 0
+        below_area_count = 0
         for scene_index_raw in self._indices:
             scene_index = int(scene_index_raw)
             image_meta = self._sfm_scene.images[scene_index]
-            if image_meta.mask_path == "":
+            if not mask_path_is_declared(image_meta.mask_path):
+                if self.mask_rasterization_mode == "off":
+                    retained_indices.append(scene_index)
+                    continue
                 raise ValueError(
                     f"mask_rasterization_mode={self.mask_rasterization_mode!r} requires a mask for every selected "
                     f"image; scene index {scene_index} ({image_meta.image_path}) has no mask"
@@ -318,25 +305,40 @@ class SfmDataset(torch.utils.data.Dataset, Iterable):
             camera_meta = image_meta.camera_metadata
             full_image_size = (camera_meta.height, camera_meta.width)
             image_height, image_width = full_image_size
+            mask = load_binary_mask(image_meta.mask_path)
+            if mask.shape != full_image_size:
+                raise ValueError(
+                    f"Mask shape {mask.shape} does not match camera image size {full_image_size} for scene index "
+                    f"{scene_index}: {image_meta.mask_path}"
+                )
+            decoded_bbox = mask_bbox_xyxy_count(mask)
             if self.mask_rasterization_mode == "bbox" and bbox_attribute is not None:
-                if not Path(image_meta.mask_path).is_file():
-                    raise FileNotFoundError(f"Mask file does not exist: {image_meta.mask_path}")
                 raw_value = np.asarray(bbox_attribute.values[scene_index], dtype=np.int64)
                 if raw_value.shape != (5,):
                     raise ValueError(
                         f"Internal attribute {CROP_MASK_BBOX_ATTRIBUTE!r} must contain five values per image; "
                         f"got shape {raw_value.shape} at scene index {scene_index}"
                     )
+                if not bbox_metadata_contains_mask(raw_value, decoded_bbox):
+                    raise ValueError(
+                        f"Stale or invalid {CROP_MASK_BBOX_ATTRIBUTE!r} at scene index {scene_index}: cached value "
+                        f"{raw_value.tolist()} does not contain decoded mask bounds {decoded_bbox.tolist()} with "
+                        f"the same valid-pixel count"
+                    )
                 raw_x0, raw_y0, raw_x1, raw_y1, valid_count = (int(value) for value in raw_value)
             else:
-                mask = _load_binary_mask(image_meta.mask_path)
-                if mask.shape != full_image_size:
-                    raise ValueError(
-                        f"Mask shape {mask.shape} does not match camera image size {full_image_size} for scene index "
-                        f"{scene_index}: {image_meta.mask_path}"
-                    )
-                if self.mask_rasterization_mode == "bbox":
-                    raw_x0, raw_y0, raw_x1, raw_y1, valid_count = _raw_mask_bbox(mask)
+                raw_x0, raw_y0, raw_x1, raw_y1, valid_count = (int(value) for value in decoded_bbox)
+
+            if valid_count == 0:
+                empty_mask_count += 1
+                continue
+            valid_area = valid_count / (image_height * image_width)
+            if self.minimum_valid_mask_area is not None and valid_area < self.minimum_valid_mask_area:
+                below_area_count += 1
+                continue
+            if self.mask_rasterization_mode == "off":
+                retained_indices.append(scene_index)
+                continue
 
             if self.mask_rasterization_mode == "bbox":
                 if not (0 <= valid_count <= image_height * image_width):
@@ -387,6 +389,20 @@ class SfmDataset(torch.utils.data.Dataset, Iterable):
                 image_loss_scale=image_loss_scale,
                 raster_tile_mask=raster_tile_mask,
             )
+            retained_indices.append(scene_index)
+
+        if not retained_indices and not self.allow_empty_after_filtering:
+            raise ValueError(
+                "Dataset contains no images with a valid mask after filtering "
+                f"({empty_mask_count} empty, {below_area_count} below minimum area)"
+            )
+        if empty_mask_count or below_area_count:
+            self._logger.info(
+                "Excluded %d empty masks and %d masks below minimum_valid_mask_area from the dataset",
+                empty_mask_count,
+                below_area_count,
+            )
+        self._indices = np.asarray(retained_indices, dtype=np.int64)
 
     @property
     def sfm_scene(self) -> SfmScene:
@@ -519,9 +535,9 @@ class SfmDataset(torch.utils.data.Dataset, Iterable):
         visible_points = set()
         for idx in self._indices:
             image_meta: SfmPosedImageMetadata = self._sfm_scene.images[idx]
-            assert image_meta.point_indices is not None, (
-                "SfmScene.has_visible_point_indices is True but image has no point indices"
-            )
+            assert (
+                image_meta.point_indices is not None
+            ), "SfmScene.has_visible_point_indices is True but image has no point indices"
             visible_points.update(image_meta.point_indices.tolist())
         return np.array(list(visible_points))
 
@@ -600,12 +616,15 @@ class SfmDataset(torch.utils.data.Dataset, Iterable):
 
         if image.ndim == 2:
             image = image[:, :, None]
-        if image_meta.mask_path == "":
+        if not mask_path_is_declared(image_meta.mask_path):
             mask = None
-        elif self.mask_rasterization_mode == "off":
-            mask = _load_legacy_binary_mask(image_meta.mask_path)
         else:
-            mask = _load_binary_mask(image_meta.mask_path)
+            mask = load_binary_mask(image_meta.mask_path)
+        if mask is not None and mask.shape != image.shape[:2]:
+            raise ValueError(
+                f"Mask shape {mask.shape} does not match decoded image size {image.shape[:2]} for scene index "
+                f"{int(index)}: {image_meta.mask_path}"
+            )
         projection_matrix = camera_meta.projection_matrix.copy()
         camera_to_world_matrix = image_meta.camera_to_world_matrix.copy()
         world_to_camera_matrix = image_meta.world_to_camera_matrix.copy()

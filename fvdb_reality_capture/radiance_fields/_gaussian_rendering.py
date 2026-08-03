@@ -235,6 +235,38 @@ class ImageSpaceRenderBackend:
             if _needs_depth_render(config)
             else model.project_gaussians_for_images
         )
+        crop_origin_w, crop_origin_h, crop_w, crop_h = crop
+        gradient_accumulation_tile_mask = None
+
+        if config.mask_rasterization_mode == "bbox":
+            if camera_model != CameraModel.PINHOLE:
+                raise ValueError("bbox mask rasterization requires pinhole cameras")
+            if (
+                crop_w <= 0
+                or crop_h <= 0
+                or crop_origin_w < 0
+                or crop_origin_h < 0
+                or crop_origin_w + crop_w > image_width
+                or crop_origin_h + crop_h > image_height
+            ):
+                raise ValueError(f"Invalid bbox raster crop {crop} for image size {(image_width, image_height)}")
+            num_tiles_w = (image_width + config.tile_size - 1) // config.tile_size
+            num_tiles_h = (image_height + config.tile_size - 1) // config.tile_size
+            tile_x0 = crop_origin_w // config.tile_size
+            tile_y0 = crop_origin_h // config.tile_size
+            tile_x1 = (crop_origin_w + crop_w + config.tile_size - 1) // config.tile_size
+            tile_y1 = (crop_origin_h + crop_h + config.tile_size - 1) // config.tile_size
+            gradient_accumulation_tile_mask = torch.zeros(
+                (world_to_camera_matrices.shape[0], num_tiles_h, num_tiles_w),
+                dtype=torch.bool,
+                device=model.device,
+            )
+            gradient_accumulation_tile_mask[:, tile_y0:tile_y1, tile_x0:tile_x1] = True
+        elif config.mask_rasterization_mode == "tiles":
+            if raster_tile_mask is None:
+                raise ValueError("tiles mask rasterization requires a raster_tile_mask")
+            raster_tile_mask = raster_tile_mask.to(device=model.device, dtype=torch.bool).contiguous()
+            gradient_accumulation_tile_mask = raster_tile_mask
         projected_gaussians = projection_function(
             world_to_camera_matrices=world_to_camera_matrices,
             projection_matrices=projection_matrices,
@@ -249,8 +281,9 @@ class ImageSpaceRenderBackend:
             min_radius_2d=config.min_radius_2d,
             eps_2d=config.eps_2d,
             antialias=config.antialias,
+            gradient_accumulation_tile_mask=gradient_accumulation_tile_mask,
+            gradient_accumulation_tile_size=config.tile_size if gradient_accumulation_tile_mask is not None else 0,
         )
-        crop_origin_w, crop_origin_h, crop_w, crop_h = crop
         rendered, alphas = model.render_from_projected_gaussians(
             projected_gaussians,
             crop_width=crop_w,
@@ -395,9 +428,7 @@ class ImageSpaceRenderBackend:
                     )
 
                 if config.mask_rasterization_mode != "off":
-                    crop_x, crop_y, crop_width, crop_height = (
-                        int(value) for value in datum["raster_crop"]
-                    )
+                    crop_x, crop_y, crop_width, crop_height = (int(value) for value in datum["raster_crop"])
                     probe_width = min(config.tile_size, crop_width)
                     probe_height = min(config.tile_size, crop_height)
                     # Exercise the translated-mean path when the selected crop has room for a nonzero origin.
@@ -408,10 +439,14 @@ class ImageSpaceRenderBackend:
 
                     probe_tile_mask = None
                     if config.mask_rasterization_mode == "tiles":
-                        probe_tile_mask = torch.as_tensor(
-                            datum["raster_tile_mask"][:1, :1],
-                            dtype=torch.bool,
-                        ).unsqueeze(0).to(device)
+                        probe_tile_mask = (
+                            torch.as_tensor(
+                                datum["raster_tile_mask"][:1, :1],
+                                dtype=torch.bool,
+                            )
+                            .unsqueeze(0)
+                            .to(device)
+                        )
                     model.render_from_projected_gaussians(
                         projected_gaussians,
                         crop_width=probe_width,
