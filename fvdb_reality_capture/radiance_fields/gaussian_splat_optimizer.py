@@ -19,6 +19,37 @@ from fvdb_reality_capture.sfm_scene import SfmScene, SpatialScaleMode
 from .base_gaussian_splat_optimizer import BaseGaussianSplatOptimizer, splat_optimizer
 from .gaussian_splatting import GaussianSplat3d
 
+_TORCH_QUANTILE_MAX_ELEMENTS = 2**24
+
+
+def _linear_quantile(values: torch.Tensor, quantile: float) -> float:
+    """Compute an exact linear-interpolated quantile without Torch's input-size limit."""
+    if values.numel() == 0:
+        raise ValueError("Cannot compute a quantile from an empty tensor")
+
+    if values.dtype not in (torch.float32, torch.float64):
+        values = values.float()
+
+    if values.device.type == "dgx":
+        # torch.quantile is not implemented by torch-dgx. NumPy is preferable to relying on
+        # other order-statistic operations which may also be unavailable on that backend.
+        return float(np.quantile(values.detach().cpu().numpy(), quantile))
+
+    if values.numel() <= _TORCH_QUANTILE_MAX_ELEMENTS:
+        return torch.quantile(values, quantile).item()
+
+    # torch.quantile rejects tensors with more than 2**24 elements. kthvalue has no such
+    # limit and avoids synchronously copying tens of millions of gradients to host memory.
+    rank = quantile * (values.numel() - 1)
+    lower_rank = math.floor(rank)
+    upper_rank = math.ceil(rank)
+    lower_value = torch.kthvalue(values, lower_rank + 1).values
+    if lower_rank == upper_rank:
+        return lower_value.item()
+
+    upper_value = torch.kthvalue(values, upper_rank + 1).values
+    return torch.lerp(lower_value, upper_value, rank - lower_rank).item()
+
 
 class InsertionGrad2dThresholdMode(str, Enum):
     """
@@ -97,9 +128,7 @@ class GaussianSplatOptimizerConfig:
     .. note:: This parameter is only used if set :obj:`use_screen_space_scales_for_refinement_until` is greater than 0.
     """
 
-    insertion_grad_2d_threshold: float = (
-        0.0002 if insertion_grad_2d_threshold_mode == InsertionGrad2dThresholdMode.CONSTANT else 0.9
-    )
+    insertion_grad_2d_threshold: float | None = None
     """
     Threshold value on the accumulated norm of projected mean gradients between refinement steps to
     determine whether a Gaussian has high error and is a candidate for duplication or splitting.
@@ -231,6 +260,25 @@ class GaussianSplatOptimizerConfig:
     """
     Learning rate for the specular spherical harmonics (order > 0).
     """
+
+    def __post_init__(self) -> None:
+        try:
+            self.insertion_grad_2d_threshold_mode = InsertionGrad2dThresholdMode(self.insertion_grad_2d_threshold_mode)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid insertion_grad_2d_threshold_mode: {self.insertion_grad_2d_threshold_mode!r}"
+            ) from exc
+
+        if self.insertion_grad_2d_threshold is None:
+            self.insertion_grad_2d_threshold = (
+                0.0002 if self.insertion_grad_2d_threshold_mode == InsertionGrad2dThresholdMode.CONSTANT else 0.9
+            )
+
+        if self.insertion_grad_2d_threshold_mode == InsertionGrad2dThresholdMode.CONSTANT:
+            if self.insertion_grad_2d_threshold <= 0.0:
+                raise ValueError("insertion_grad_2d_threshold must be > 0.0 when using CONSTANT mode")
+        elif not (0.0 < self.insertion_grad_2d_threshold < 1.0):
+            raise ValueError("insertion_grad_2d_threshold must be in the range (0.0, 1.0) when using percentile modes")
 
     def make_optimizer(self, model: GaussianSplat3d, sfm_scene: SfmScene) -> BaseGaussianSplatOptimizer:
         return GaussianSplatOptimizer.from_model_and_scene(
@@ -560,6 +608,90 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
         return {"num_deleted": num_deleted}
 
     @torch.no_grad()
+    def _limit_insertion_masks_to_max_gaussians(
+        self,
+        is_duplicated: torch.Tensor,
+        is_split: torch.Tensor,
+        is_deleted: torch.Tensor,
+        insertion_priorities: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Keep the highest-priority insertion candidates which fit within max_gaussians."""
+        max_gaussians = self._config.max_gaussians
+        if max_gaussians <= 0:
+            return is_duplicated, is_split
+
+        duplication_cost = self._config.insertion_duplication_factor - 1
+        split_cost = self._config.insertion_split_factor - 1
+        num_deleted = int(is_deleted.sum().item())
+        available_growth = max(max_gaussians - (self._model.num_gaussians - num_deleted), 0)
+        requested_growth = int(is_duplicated.sum().item() * duplication_cost + is_split.sum().item() * split_cost)
+        if requested_growth <= available_growth:
+            return is_duplicated, is_split
+
+        candidate_indices = torch.where(is_duplicated | is_split)[0]
+        candidate_priorities = insertion_priorities[candidate_indices]
+        candidate_costs = torch.where(
+            is_duplicated[candidate_indices],
+            torch.full_like(candidate_indices, duplication_cost),
+            torch.full_like(candidate_indices, split_cost),
+        )
+
+        if available_growth == 0:
+            selected_positions = torch.empty(0, dtype=torch.long, device=candidate_indices.device)
+        elif duplication_cost == split_cost:
+            num_selected = min(len(candidate_indices), available_growth // duplication_cost)
+            if num_selected == 0:
+                selected_positions = torch.empty(0, dtype=torch.long, device=candidate_indices.device)
+            elif candidate_priorities.device.type == "dgx":
+                priorities_numpy = np.nan_to_num(
+                    candidate_priorities.detach().cpu().numpy(),
+                    copy=True,
+                    nan=-np.inf,
+                    neginf=-np.inf,
+                )
+                partition_start = len(priorities_numpy) - num_selected
+                selected_numpy = np.argpartition(priorities_numpy, partition_start)[partition_start:]
+                selected_positions = torch.as_tensor(
+                    selected_numpy.copy(), dtype=torch.long, device=candidate_indices.device
+                )
+            else:
+                finite_priorities = torch.nan_to_num(
+                    candidate_priorities, nan=-math.inf, neginf=-math.inf, posinf=math.inf
+                )
+                selected_positions = torch.topk(finite_priorities, num_selected, sorted=False).indices
+        elif candidate_priorities.device.type == "dgx":
+            priorities_numpy = np.nan_to_num(
+                candidate_priorities.detach().cpu().numpy(),
+                copy=True,
+                nan=-np.inf,
+                neginf=-np.inf,
+            )
+            costs_numpy = candidate_costs.detach().cpu().numpy()
+            priority_order = np.argsort(priorities_numpy, kind="stable")[::-1]
+            selected_numpy = priority_order[np.cumsum(costs_numpy[priority_order]) <= available_growth]
+            selected_positions = torch.as_tensor(
+                selected_numpy.copy(), dtype=torch.long, device=candidate_indices.device
+            )
+        else:
+            finite_priorities = torch.nan_to_num(candidate_priorities, nan=-math.inf, neginf=-math.inf, posinf=math.inf)
+            priority_order = torch.argsort(finite_priorities, descending=True, stable=True)
+            cumulative_cost = torch.cumsum(candidate_costs[priority_order], dim=0)
+            selected_positions = priority_order[cumulative_cost <= available_growth]
+
+        selected_mask = torch.zeros_like(is_duplicated)
+        selected_mask[candidate_indices[selected_positions]] = True
+        is_duplicated.logical_and_(selected_mask)
+        is_split.logical_and_(selected_mask)
+
+        selected_growth = int(is_duplicated.sum().item() * duplication_cost + is_split.sum().item() * split_cost)
+        self._logger.warning(
+            f"Limiting refinement insertion from {len(candidate_indices):,} candidates "
+            f"({requested_growth:,} net Gaussians) to {int(selected_mask.sum().item()):,} candidates "
+            f"({selected_growth:,} net Gaussians) to respect max_gaussians ({max_gaussians:,})."
+        )
+        return is_duplicated, is_split
+
+    @torch.no_grad()
     def refine(self, zero_gradients: bool = True) -> dict[str, int]:
         """
         Perform a step of refinement by inserting Gaussians where more detail is needed and deleting Gaussians that are
@@ -600,7 +732,7 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
             # We no longer need to track the max 2D radii since we're not using them for refinement
             self._model.accumulate_max_2d_radii = False
 
-        is_duplicated, is_split = self._compute_insertion_masks(use_screen_space_scales)
+        is_duplicated, is_split, insertion_priorities = self._compute_insertion_masks(use_screen_space_scales)
 
         use_scales_for_deletion = self._refine_count > self._config.use_scales_for_deletion_after_n_refinements
         is_deleted = self._compute_deletion_mask(use_scales_for_deletion, use_screen_space_scales)
@@ -608,6 +740,10 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
         # We won't insert Gaussians which are up for deletion since they will be deleted anyway
         is_duplicated.logical_and_(~is_deleted)
         is_split.logical_and_(~is_deleted)
+
+        is_duplicated, is_split = self._limit_insertion_masks_to_max_gaussians(
+            is_duplicated, is_split, is_deleted, insertion_priorities
+        )
 
         # Get the new Gaussians to add from splitting and duplication
         duplication_indices = torch.where(is_duplicated)[0]
@@ -632,16 +768,6 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
         )
         num_gaussians_before_refinement = self._model.num_gaussians
         num_gaussians_after_refinement = num_gaussians_before_refinement + num_added_gaussians
-        if self._config.max_gaussians > 0 and num_gaussians_after_refinement > self._config.max_gaussians:
-            self._logger.warning(
-                f"Refinement would insert a net of {num_added_gaussians} leading to {num_gaussians_after_refinement} which exceeds max_gaussians ({self._config.max_gaussians}), skipping refinement step"
-            )
-            if should_reset_opacities:
-                self._reset_opacities()
-
-            self._refine_count += 1
-            return {"num_duplicated": 0, "num_split": 0, "num_deleted": 0}
-
         # Get indices of Gaussians which are preserved during refinement
         kept_indices = torch.where(~(is_split | is_deleted))[0]
 
@@ -816,15 +942,23 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
             insertion_grad_2d_threshold (float): The threshold value to use for deciding whether to insert Gaussians during refinement.
         """
 
-        # Helper to compute the quantile of the gradients, using NumPy if we have too many Gaussians for torch.quantile
-        # which has a cap at 2**24 elements
+        if (
+            self._config.insertion_grad_2d_threshold_mode != InsertionGrad2dThresholdMode.CONSTANT
+            and accumulated_mean_2d_gradients.numel() == 0
+        ):
+            if not getattr(self, "_warned_no_valid_gradient_samples", False):
+                self._logger.warning(
+                    "No finite gradient samples were observed before refinement; skipping Gaussian insertion."
+                )
+                self._warned_no_valid_gradient_samples = True
+            return math.inf
+
         def _grad_2d_quantile(quantile: float) -> float:
-            if self._model.num_gaussians > 2**24:
-                # torch.quantile has a cap at 2**24 elements so fall back to NumPy for large numbers of Gaussians
+            if accumulated_mean_2d_gradients.device.type == "dgx":
                 self._logger.debug("Using numpy to compute gradient percentile threshold")
-                return float(np.quantile(accumulated_mean_2d_gradients.cpu().numpy(), quantile))
-            else:
-                return torch.quantile(accumulated_mean_2d_gradients, quantile).item()
+            elif accumulated_mean_2d_gradients.numel() > _TORCH_QUANTILE_MAX_ELEMENTS:
+                self._logger.debug("Using kthvalue to compute large gradient percentile threshold")
+            return _linear_quantile(accumulated_mean_2d_gradients, quantile)
 
         # Determine the threshold for the 2D projected gradient based on the selected mode
         if self._config.insertion_grad_2d_threshold_mode == InsertionGrad2dThresholdMode.CONSTANT:
@@ -836,10 +970,12 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
             # In PERCENTILE_FIRST_ITERATION mode, we set the threshold to the given percentile of the gradients
             # during the first refinement step, and then use that fixed threshold for all subsequent steps
             if self._insertion_grad_2d_abs_threshold is None:
-                self._insertion_grad_2d_abs_threshold = _grad_2d_quantile(self._config.insertion_grad_2d_threshold)
+                quantile = self._config.insertion_grad_2d_threshold
+                assert quantile is not None
+                self._insertion_grad_2d_abs_threshold = _grad_2d_quantile(quantile)
                 self._logger.debug(
                     f"Setting fixed grad2d threshold to {self._insertion_grad_2d_abs_threshold:.6f} corresponding to the "
-                    f"({self._config.insertion_grad_2d_threshold * 100:.1f} percentile)"
+                    f"({quantile * 100:.1f} percentile)"
                 )
             assert self._insertion_grad_2d_abs_threshold is not None
             return self._insertion_grad_2d_abs_threshold
@@ -847,7 +983,13 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
         elif self._config.insertion_grad_2d_threshold_mode == InsertionGrad2dThresholdMode.PERCENTILE_EVERY_ITERATION:
             # In PERCENTILE_EVERY_ITERATION mode, we set the threshold to the given percentile of the gradients
             # during every refinement step
-            return _grad_2d_quantile(self._config.insertion_grad_2d_threshold)
+            quantile = self._config.insertion_grad_2d_threshold
+            assert quantile is not None
+            threshold = _grad_2d_quantile(quantile)
+            self._logger.debug(
+                f"Setting grad2d threshold to {threshold:.6f} corresponding to the ({quantile * 100:.1f} percentile)"
+            )
+            return threshold
 
         else:
             raise RuntimeError("Invalid mode for insertion_grad_2d_threshold.")
@@ -855,7 +997,7 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
     @torch.no_grad()
     def _compute_insertion_masks(
         self, use_screen_space_scales_for_splitting: bool
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute boolean masks indicating which Gaussians should be duplicated or split.
 
@@ -867,6 +1009,8 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
         Returns:
             duplication_mask (torch.Tensor): A boolean mask indicating which Gaussians should be duplicated.
             split_mask (torch.Tensor): A boolean mask indicating which Gaussians should be split.
+            insertion_priorities (torch.Tensor): The average projected-gradient norms used to prioritize candidates
+                if max_gaussians limits insertion.
         """
         # We use the average norm of the gradients of the projected Gaussians with respect to the
         # loss (accumulated since the last refinement step) to decide which Gaussians to duplicate or split.
@@ -887,15 +1031,18 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
                 self._warned_missing_gradient_accumulation = True
             device = self._model.means.device
             N = self._model.num_gaussians
+            empty_priorities = torch.zeros(N, dtype=self._model.means.dtype, device=device)
             return (
                 torch.zeros(N, dtype=torch.bool, device=device),
                 torch.zeros(N, dtype=torch.bool, device=device),
+                empty_priorities,
             )
 
         # model.accumulated_gradient_step_counts is the number of times a Gaussian has been projected
         # to an image (i.e. included in the loss gradient computation)
         # model.accumulated_mean_2d_gradient_norms is the sum of norms of the gradients of the
         # projected Gaussians (dL/dμ2D) since the last refinement step.
+        has_gradient_samples = self._model.accumulated_gradient_step_counts > 0
         count = self._model.accumulated_gradient_step_counts.clamp_min(1)
         if self._num_grad_accumulation_steps > 1:
             # Multiply the 2D gradient count by the number of times we've called backward since the last zero_grad()
@@ -903,6 +1050,8 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
             count *= self._num_grad_accumulation_steps
         avg_norm_of_projected_mean_gradients = self._model.accumulated_mean_2d_gradient_norms / count
 
+        has_finite_gradient = torch.isfinite(avg_norm_of_projected_mean_gradients)
+        has_valid_gradient = has_gradient_samples & has_finite_gradient
         # If the average norm of 2D projected gradients is high, that Gaussian is likely introducing
         # a lot of error into the reconstruction, and is a candidate for duplication or splitting.
         # We use the configured threshold to determine what "high" means.
@@ -910,9 +1059,13 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
         # If the 3D scale is large, we split the Gaussian to allow it to specialize.
         # Duplication and splitting are mutually exclusive in the current logic:
         # a Gaussian is either duplicated (if small) or split (if large), but not both.
-        is_grad_high = avg_norm_of_projected_mean_gradients > self._compute_insertion_grad_2d_threshold(
-            avg_norm_of_projected_mean_gradients
+        threshold_samples = (
+            avg_norm_of_projected_mean_gradients[has_valid_gradient]
+            if self._config.insertion_grad_2d_threshold_mode != InsertionGrad2dThresholdMode.CONSTANT
+            else avg_norm_of_projected_mean_gradients
         )
+        insertion_grad_threshold = self._compute_insertion_grad_2d_threshold(threshold_samples)
+        is_grad_high = has_valid_gradient & (avg_norm_of_projected_mean_gradients > insertion_grad_threshold)
         is_small = self._model.log_scales.max(dim=-1).values <= np.log(
             self._config.insertion_scale_3d_threshold * self._spatial_scale
         )
@@ -931,7 +1084,11 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
                 )
             is_split.logical_or_(self._model.accumulated_max_2d_radii > self._config.insertion_scale_2d_threshold)
 
-        return is_duplicated, is_split
+        # A screen-space split can also select a small Gaussian marked for duplication. Splitting
+        # takes precedence so refinement cardinality and max_gaussians accounting remain exact.
+        is_duplicated.logical_and_(~is_split)
+
+        return is_duplicated, is_split, avg_norm_of_projected_mean_gradients
 
     @torch.no_grad()
     def _compute_deletion_mask(

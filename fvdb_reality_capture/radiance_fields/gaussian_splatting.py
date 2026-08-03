@@ -49,6 +49,18 @@ def _pixel_mask_to_tile_mask(pixel_mask: torch.Tensor, tile_size: int) -> torch.
     )
 
 
+def _cumsum_last_dim_with_1d_scan(values: torch.Tensor) -> torch.Tensor:
+    """Compute a row-wise cumulative sum using only a one-dimensional scan."""
+    if values.numel() == 0:
+        return values
+
+    row_width = values.shape[-1]
+    rows = values.reshape(-1, row_width)
+    flat_cumsum = torch.cumsum(rows.reshape(-1), dim=0, dtype=values.dtype).reshape_as(rows)
+    row_offsets = torch.cat((flat_cumsum.new_zeros(1), flat_cumsum[:-1, -1])).unsqueeze(-1)
+    return (flat_cumsum - row_offsets).reshape_as(values)
+
+
 def _tile_mask_to_summed_area_table(tile_mask: torch.Tensor) -> torch.Tensor:
     """Build a padded int32 summed-area table for a boolean mask [C, tileH, tileW]."""
     if tile_mask.ndim != 3:
@@ -59,8 +71,14 @@ def _tile_mask_to_summed_area_table(tile_mask: torch.Tensor) -> torch.Tensor:
         tile_mask = tile_mask.contiguous()
 
     values = tile_mask.to(dtype=torch.int32)
-    values = torch.cumsum(values, dim=-2, dtype=torch.int32)
-    values = torch.cumsum(values, dim=-1, dtype=torch.int32)
+    if tile_mask.device.type == "dgx":
+        # torch-dgx currently supports cumsum only for 1D tensors along dim 0.
+        values = _cumsum_last_dim_with_1d_scan(values.transpose(-2, -1).contiguous())
+        values = values.transpose(-2, -1).contiguous()
+        values = _cumsum_last_dim_with_1d_scan(values)
+    else:
+        values = torch.cumsum(values, dim=-2, dtype=torch.int32)
+        values = torch.cumsum(values, dim=-1, dtype=torch.int32)
     summed_area_table = torch.zeros(
         (*tile_mask.shape[:-2], tile_mask.shape[-2] + 1, tile_mask.shape[-1] + 1),
         dtype=torch.int32,

@@ -79,6 +79,18 @@ def _validate_mask_rasterization_config(
         raise ValueError(f"Mask-aware rasterization currently supports RGB models only; got {num_channels} channels.")
 
 
+def _composite_background(image: torch.Tensor, alphas: torch.Tensor, background: torch.Tensor) -> torch.Tensor:
+    """Composite a BHWC image without broadcasting the alpha channel."""
+    alpha_without_channel = alphas[..., 0]
+    return torch.stack(
+        [
+            image[..., channel] + background[:, channel].reshape(-1, 1, 1) * (1.0 - alpha_without_channel)
+            for channel in range(image.shape[-1])
+        ],
+        dim=-1,
+    )
+
+
 def _masked_ground_truth(
     ground_truth: torch.Tensor, prediction: torch.Tensor, valid_mask: torch.Tensor
 ) -> torch.Tensor:
@@ -121,7 +133,7 @@ def _masked_l1_losses(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return full-image- and valid-normalized strict masked L1 losses."""
     valid = _validate_masked_image_inputs(prediction, target, valid_mask)
-    valid_channels = valid.unsqueeze(-1).expand_as(prediction)
+    valid_channels = valid.unsqueeze(-1).expand_as(prediction).contiguous()
     zero = prediction.new_zeros(())
     safe_prediction = torch.where(valid_channels, prediction, zero)
     safe_target = torch.where(valid_channels, target, zero)
@@ -142,7 +154,7 @@ def _masked_ssim_losses(
         valid.unsqueeze(1),
         reduction="none",
     )
-    valid_centers = valid.unsqueeze(1).expand_as(ssim_map)
+    valid_centers = valid.unsqueeze(1).expand_as(ssim_map).contiguous()
     loss_map = torch.where(valid_centers, 1.0 - ssim_map, torch.zeros_like(ssim_map))
     full_image_loss = loss_map.mean()
     valid_loss = loss_map.sum() / valid_centers.sum().clamp_min(1)
@@ -152,7 +164,7 @@ def _masked_ssim_losses(
 def _masked_psnr(prediction: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
     """Compute valid-pixel PSNR for BHWC images."""
     valid = _validate_masked_image_inputs(prediction, target, valid_mask)
-    valid_channels = valid.unsqueeze(-1).expand_as(prediction)
+    valid_channels = valid.unsqueeze(-1).expand_as(prediction).contiguous()
     zero = prediction.new_zeros(())
     safe_prediction = torch.where(valid_channels, prediction, zero)
     safe_target = torch.where(valid_channels, target, zero)
@@ -1435,7 +1447,8 @@ class GaussianSplatReconstruction:
                 unit_quats = nnf.normalize(self.model.quats, dim=-1)
                 rotation_matrices = GaussianSplatOptimizer._unit_quats_to_rotation_matrices(unit_quats)
                 scaled_axes = rotation_matrices * self.model.scales.unsqueeze(-2)
-                support_extent = support_sigma * torch.sqrt(torch.sum(torch.square(scaled_axes), dim=-1))
+                squared_extent = torch.sum(torch.square(scaled_axes), dim=-1, keepdim=True)
+                support_extent = support_sigma * torch.sqrt(squared_extent).squeeze(-1)
 
             bbox_min_tensor = torch.as_tensor(bbox_min, device=points.device, dtype=points.dtype)
             bbox_max_tensor = torch.as_tensor(bbox_max, device=points.device, dtype=points.dtype)
@@ -1664,7 +1677,7 @@ class GaussianSplatReconstruction:
                     # If you want to add random background, we'll mix it in here
                     if self.config.random_bkgd:
                         bkgd = torch.rand(1, 3, device=self.device)
-                        image = image + bkgd * (1.0 - render_outputs.alpha)
+                        image = _composite_background(image, render_outputs.alpha, bkgd)
 
                     # Image losses
                     if mask_pixels is not None:
@@ -1758,7 +1771,7 @@ class GaussianSplatReconstruction:
 
                 # Refine before the stop step and enforce bbox clipping on the same cadence throughout training.
                 is_refinement_cadence_step = self._global_step % refine_every_step == 0
-                is_after_refinement_start = self._global_step > refine_start_step
+                is_after_refinement_start = self._global_step >= refine_start_step
                 if is_refinement_cadence_step and (is_after_refinement_start or self._global_step >= refine_stop_step):
                     if is_after_refinement_start and self._global_step < refine_stop_step:
                         self.optimizer.refine()
@@ -1800,8 +1813,13 @@ class GaussianSplatReconstruction:
 
                 # Log metrics
                 if self._global_step % self._log_interval_steps == 0:
-                    mem_allocated = torch.cuda.memory_allocated(self.device) / (1024**3)
-                    mem_reserved = torch.cuda.memory_reserved(self.device) / (1024**3)
+                    if self.device.type == "dgx":
+                        cuda_devices = range(torch.cuda.device_count())
+                        mem_allocated = sum(torch.cuda.memory_allocated(device) for device in cuda_devices) / (1024**3)
+                        mem_reserved = sum(torch.cuda.memory_reserved(device) for device in cuda_devices) / (1024**3)
+                    else:
+                        mem_allocated = torch.cuda.memory_allocated(self.device) / (1024**3)
+                        mem_reserved = torch.cuda.memory_reserved(self.device) / (1024**3)
                     self._writer.log_metric(self._global_step, f"{log_tag}/loss", loss.item())
                     self._writer.log_metric(self._global_step, f"{log_tag}/l1loss", l1loss.item())
                     self._writer.log_metric(self._global_step, f"{log_tag}/ssimloss", ssimloss.item())

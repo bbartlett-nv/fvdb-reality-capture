@@ -12,11 +12,33 @@ from fvdb_reality_capture.radiance_fields.gaussian_splat_optimizer import Gaussi
 from fvdb_reality_capture.radiance_fields.gaussian_splat_reconstruction import (
     GaussianSplatReconstruction,
     GaussianSplatReconstructionConfig,
+    _composite_background,
     _masked_ground_truth,
     _masked_l1_losses,
     _masked_ssim_losses,
     _validate_mask_rasterization_config,
 )
+
+
+class TestCompositeBackground(unittest.TestCase):
+    def test_matches_broadcast_formula_and_gradients(self):
+        generator = torch.Generator().manual_seed(1234)
+        image = torch.rand((2, 3, 4, 3), generator=generator, requires_grad=True)
+        alphas = torch.rand((2, 3, 4, 1), generator=generator, requires_grad=True)
+        background = torch.rand((1, 3), generator=generator)
+        reference_image = image.detach().clone().requires_grad_(True)
+        reference_alphas = alphas.detach().clone().requires_grad_(True)
+
+        actual = _composite_background(image, alphas, background)
+        expected = reference_image + background[:, None, None, :] * (1.0 - reference_alphas)
+
+        weights = torch.arange(actual.numel(), dtype=actual.dtype).reshape_as(actual) / actual.numel()
+        (actual * weights).sum().backward()
+        (expected * weights).sum().backward()
+
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(image.grad, reference_image.grad)
+        torch.testing.assert_close(alphas.grad, reference_alphas.grad)
 
 
 class TestMaskedGroundTruth(unittest.TestCase):
@@ -378,7 +400,8 @@ class TestPostRefinementPruningAndScaleFreeze(unittest.TestCase):
         self.assertEqual(step_observations, [(0, False), (1, False), (2, True), (3, True)])
         self.assertEqual(render_observations, [(0, True), (1, True), (2, False), (3, False)])
         self.assertEqual(prune_steps, [2, 3, 4])
-        runner._optimizer.refine.assert_called_once_with()
+        # Refinement runs at both step 0 (the configured start boundary) and step 1.
+        self.assertEqual(runner._optimizer.refine.call_count, 2)
         self.assertEqual(
             [call.kwargs for call in runner._optimizer.prune.call_args_list],
             [{"use_scale_threshold": True}] * 3,

@@ -2,15 +2,165 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+import logging
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 import fvdb_reality_capture as frc
 from fvdb_reality_capture import GaussianSplat3d
+from fvdb_reality_capture.radiance_fields.gaussian_splat_optimizer import _linear_quantile
 from tests.unit.common import GettysburgGaussianSplatTestCase
+
+
+class GaussianSplatOptimizerConfigAndPercentileTests(unittest.TestCase):
+    @staticmethod
+    def _make_percentile_optimizer(
+        mode: frc.radiance_fields.InsertionGrad2dThresholdMode,
+        threshold: float | None = None,
+    ) -> frc.radiance_fields.GaussianSplatOptimizer:
+        config = frc.radiance_fields.GaussianSplatOptimizerConfig(
+            insertion_grad_2d_threshold_mode=mode,
+            insertion_grad_2d_threshold=threshold,
+            insertion_scale_3d_threshold=1.0,
+            spatial_scale_mode=frc.radiance_fields.SpatialScaleMode.ABSOLUTE_UNITS,
+        )
+        optimizer = object.__new__(frc.radiance_fields.GaussianSplatOptimizer)
+        optimizer._config = config
+        optimizer._logger = logging.getLogger("test_percentile_optimizer")
+        optimizer._insertion_grad_2d_abs_threshold = None
+        optimizer._num_grad_accumulation_steps = 1
+        optimizer._spatial_scale = 1.0
+        return optimizer
+
+    def test_mode_dependent_threshold_defaults(self):
+        constant = frc.radiance_fields.GaussianSplatOptimizerConfig()
+        percentile_first = frc.radiance_fields.GaussianSplatOptimizerConfig(
+            insertion_grad_2d_threshold_mode=(
+                frc.radiance_fields.InsertionGrad2dThresholdMode.PERCENTILE_FIRST_ITERATION
+            )
+        )
+        percentile_every = frc.radiance_fields.GaussianSplatOptimizerConfig(
+            insertion_grad_2d_threshold_mode=(
+                frc.radiance_fields.InsertionGrad2dThresholdMode.PERCENTILE_EVERY_ITERATION
+            )
+        )
+
+        self.assertEqual(constant.insertion_grad_2d_threshold, 0.0002)
+        self.assertEqual(percentile_first.insertion_grad_2d_threshold, 0.9)
+        self.assertEqual(percentile_every.insertion_grad_2d_threshold, 0.9)
+
+    def test_large_quantile_uses_exact_order_statistics_and_upcasts_half(self):
+        values = torch.tensor([0.0, 10.0, 20.0, 30.0, 40.0], dtype=torch.float16)
+        with patch(
+            "fvdb_reality_capture.radiance_fields.gaussian_splat_optimizer._TORCH_QUANTILE_MAX_ELEMENTS",
+            4,
+        ):
+            result = _linear_quantile(values, 0.625)
+
+        self.assertEqual(result, 25.0)
+
+    def test_percentile_ignores_unobserved_gaussians(self):
+        optimizer = self._make_percentile_optimizer(
+            frc.radiance_fields.InsertionGrad2dThresholdMode.PERCENTILE_EVERY_ITERATION
+        )
+        num_unobserved = 100
+        observed_gradients = torch.arange(1.0, 11.0)
+        num_gaussians = num_unobserved + len(observed_gradients)
+        step_counts = torch.zeros(num_gaussians, dtype=torch.int32)
+        step_counts[num_unobserved:] = 1
+        gradient_norms = torch.zeros(num_gaussians)
+        gradient_norms[num_unobserved:] = observed_gradients
+        optimizer._model = SimpleNamespace(
+            accumulated_gradient_step_counts=step_counts,
+            accumulated_mean_2d_gradient_norms=gradient_norms,
+            accumulate_max_2d_radii=False,
+            log_scales=torch.full((num_gaussians, 3), -10.0),
+            means=torch.zeros((num_gaussians, 3)),
+            num_gaussians=num_gaussians,
+        )
+
+        duplication_mask, split_mask, _ = optimizer._compute_insertion_masks(False)
+
+        self.assertEqual(int(duplication_mask.sum().item()), 1)
+        self.assertTrue(duplication_mask[-1].item())
+        self.assertFalse(split_mask.any().item())
+
+    def test_percentile_ignores_nonfinite_gradients(self):
+        optimizer = self._make_percentile_optimizer(
+            frc.radiance_fields.InsertionGrad2dThresholdMode.PERCENTILE_EVERY_ITERATION
+        )
+        gradient_norms = torch.tensor([float("nan"), float("inf"), *range(1, 11)], dtype=torch.float32)
+        num_gaussians = len(gradient_norms)
+        optimizer._model = SimpleNamespace(
+            accumulated_gradient_step_counts=torch.ones(num_gaussians, dtype=torch.int32),
+            accumulated_mean_2d_gradient_norms=gradient_norms,
+            accumulate_max_2d_radii=False,
+            log_scales=torch.full((num_gaussians, 3), -10.0),
+            means=torch.zeros((num_gaussians, 3)),
+            num_gaussians=num_gaussians,
+        )
+
+        duplication_mask, split_mask, _ = optimizer._compute_insertion_masks(False)
+
+        self.assertEqual(int(duplication_mask.sum().item()), 1)
+        self.assertTrue(duplication_mask[-1].item())
+        self.assertFalse(split_mask.any().item())
+
+    def test_first_percentile_does_not_cache_an_empty_sample(self):
+        optimizer = self._make_percentile_optimizer(
+            frc.radiance_fields.InsertionGrad2dThresholdMode.PERCENTILE_FIRST_ITERATION
+        )
+
+        self.assertEqual(optimizer._compute_insertion_grad_2d_threshold(torch.empty(0)), float("inf"))
+        self.assertIsNone(optimizer._insertion_grad_2d_abs_threshold)
+        self.assertAlmostEqual(
+            optimizer._compute_insertion_grad_2d_threshold(torch.tensor([1.0, 2.0, 3.0])),
+            2.8,
+        )
+        self.assertAlmostEqual(optimizer._insertion_grad_2d_abs_threshold, 2.8)
+
+    def test_screen_space_split_takes_precedence_over_duplication(self):
+        optimizer = self._make_percentile_optimizer(
+            frc.radiance_fields.InsertionGrad2dThresholdMode.PERCENTILE_EVERY_ITERATION,
+            threshold=0.5,
+        )
+        optimizer._model = SimpleNamespace(
+            accumulated_gradient_step_counts=torch.ones(2, dtype=torch.int32),
+            accumulated_mean_2d_gradient_norms=torch.tensor([1.0, 10.0]),
+            accumulated_max_2d_radii=torch.tensor([0.0, 1.0]),
+            accumulate_max_2d_radii=True,
+            log_scales=torch.full((2, 3), -10.0),
+            means=torch.zeros((2, 3)),
+            num_gaussians=2,
+        )
+
+        duplication_mask, split_mask, _ = optimizer._compute_insertion_masks(True)
+
+        torch.testing.assert_close(duplication_mask, torch.tensor([False, False]))
+        torch.testing.assert_close(split_mask, torch.tensor([False, True]))
+
+    def test_max_gaussian_budget_keeps_highest_priority_candidates(self):
+        optimizer = self._make_percentile_optimizer(
+            frc.radiance_fields.InsertionGrad2dThresholdMode.PERCENTILE_EVERY_ITERATION
+        )
+        optimizer._config.max_gaussians = 11
+        optimizer._model = SimpleNamespace(num_gaussians=10)
+
+        duplication_mask = torch.tensor([True, True, True, True, False, False, False, False, False, False])
+        split_mask = torch.tensor([False, False, False, False, True, True, True, True, False, False])
+        deletion_mask = torch.tensor([False, False, False, False, False, False, False, False, True, True])
+        priorities = torch.arange(10.0)
+
+        limited_duplication, limited_split = optimizer._limit_insertion_masks_to_max_gaussians(
+            duplication_mask, split_mask, deletion_mask, priorities
+        )
+
+        expected_selected = torch.tensor([False, False, False, False, False, True, True, True, False, False])
+        torch.testing.assert_close(limited_duplication | limited_split, expected_selected)
 
 
 class GaussianSplatOptimizerTests(GettysburgGaussianSplatTestCase, unittest.TestCase):
@@ -289,13 +439,11 @@ class GaussianSplatOptimizerRefinementTests(GettysburgGaussianSplatTestCase, uni
         assert model.sh0.grad is not None
         sh0_grad_before = model.sh0.grad.detach().clone()
         sh0_state_before = {
-            key: value.detach().clone()
-            for key, value in optimizer._optimizer.state[model.sh0].items()
-            if key != "step"
+            key: value.detach().clone() for key, value in optimizer._optimizer.state[model.sh0].items() if key != "step"
         }
         refine_count_before = optimizer._refine_count
 
-        # Full refine() would skip everything at this cap; prune-only deletion must still run.
+        # A cap below the current model size must not prevent prune-only deletion.
         optimizer._config.max_gaussians = 1
         optimizer._config.use_scales_for_deletion_after_n_refinements = 100_000
         with patch.object(optimizer, "filter_gaussians", wraps=optimizer.filter_gaussians) as filter_gaussians:
@@ -522,6 +670,35 @@ class GaussianSplatOptimizerRefinementTests(GettysburgGaussianSplatTestCase, uni
         self.assertEqual(num_split, expected_num_splits)
         self.assertEqual(num_deleted, expected_num_deletions)
         self.assertEqual(model.num_gaussians, initial_num_gaussians + num_duplicated + num_split - num_deleted)
+
+    def test_refinement_limits_insertion_to_budget_and_still_deletes(self):
+        model = self.model
+        optimizer = self.optimizer
+        initial_num_gaussians = model.num_gaussians
+        num_insertion_candidates = min(max(8, initial_num_gaussians // 5), initial_num_gaussians - 2)
+        if num_insertion_candidates < 4:
+            self.skipTest("Test model needs at least six Gaussians")
+
+        self._setup_no_refinement()
+        permutation = torch.randperm(initial_num_gaussians, device=model.device)
+        insertion_indices = permutation[:num_insertion_candidates]
+        deletion_indices = permutation[num_insertion_candidates : num_insertion_candidates + 2]
+        self._setup_gaussians_for_insertion(insertion_indices)
+        expected_num_deleted = self._setup_gaussians_for_deletion(deletion_indices)
+
+        optimizer._config.max_gaussians = initial_num_gaussians + 1
+        optimizer._config.post_refinement_sort = False
+        optimizer._config.use_scales_for_deletion_after_n_refinements = 100_000
+
+        refine_stats = optimizer.refine(zero_gradients=True)
+
+        num_inserted = refine_stats["num_duplicated"] + refine_stats["num_split"]
+        self.assertEqual(expected_num_deleted, 2)
+        self.assertEqual(refine_stats["num_deleted"], expected_num_deleted)
+        self.assertEqual(num_inserted, 3)
+        self.assertEqual(model.num_gaussians, optimizer._config.max_gaussians)
+        self.assertIsNone(model.accumulated_mean_2d_gradient_norms)
+        self.assertIsNone(model.accumulated_gradient_step_counts)
 
     def _setup_no_refinement(self):
         """
