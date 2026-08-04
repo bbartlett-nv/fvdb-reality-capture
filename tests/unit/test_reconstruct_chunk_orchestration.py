@@ -23,7 +23,6 @@ from fvdb_reality_capture.sfm_scene import (
 )
 from fvdb_reality_capture.spatial_chunking import plan_spatial_chunks
 
-
 _RECONSTRUCT_MODULE = "fvdb_reality_capture.cli.frgs._reconstruct"
 
 
@@ -442,6 +441,11 @@ class ReconstructChunkOrchestrationTest(unittest.TestCase):
                 lambda command: setattr(command.opt, "spatial_scale_mode", SpatialScaleMode.MEDIAN_CAMERA_DEPTH),
                 "spatial_scale_mode",
             ),
+            (
+                "sparse depth",
+                lambda command: setattr(command.cfg, "sparse_depth_reg", 0.1),
+                "sparse_depth_reg",
+            ),
         )
         for label, make_incompatible, expected_reason in cases:
             with self.subTest(label=label):
@@ -524,7 +528,6 @@ class ReconstructChunkOrchestrationTest(unittest.TestCase):
     def test_single_colmap_bbox_fast_path_checks_only_global_pre_crop_semantics(self):
         command = self._compatible_single_bbox_command()
         command.tx.crop_to_points = True
-        command.tx.min_points_per_image = 100
         command.opt.spatial_scale_mode = SpatialScaleMode.MAX_CAMERA_TO_CENTROID
 
         with mock.patch(
@@ -547,6 +550,21 @@ class ReconstructChunkOrchestrationTest(unittest.TestCase):
                 "point filter",
                 lambda candidate: setattr(candidate.tx, "points_percentile_filter", 1.0),
                 "points_percentile_filter",
+            ),
+            (
+                "minimum points per image",
+                lambda candidate: setattr(candidate.tx, "min_points_per_image", 0),
+                "min_points_per_image",
+            ),
+            (
+                "sparse depth",
+                lambda candidate: setattr(candidate.cfg, "sparse_depth_reg", 0.1),
+                "sparse_depth_reg",
+            ),
+            (
+                "visibility spatial scale",
+                lambda candidate: setattr(candidate.opt, "spatial_scale_mode", SpatialScaleMode.MAX_CAMERA_DEPTH),
+                "spatial_scale_mode",
             ),
         )
         for label, make_incompatible, expected_reason in cases:
@@ -616,7 +634,7 @@ class ReconstructChunkOrchestrationTest(unittest.TestCase):
         run_single.assert_called_once_with(transformed_scene, writer, None)
         logs = "\n".join(captured_logs.output)
         self.assertIn("Single-scene COLMAP bbox fast path selected", logs)
-        self.assertIn("scanning 12,345 trackless initialization points", logs)
+        self.assertIn("scanning 12,345 bounded-load initialization points", logs)
         self.assertIn("selected 7 of 12,345 initialization points", logs)
         self.assertIn("loaded 7 of 12,345 initialization points", logs)
         self.assertIn("Applying configured scene transforms to 7 initialization points", logs)

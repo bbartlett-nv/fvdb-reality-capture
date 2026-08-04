@@ -65,7 +65,6 @@ from ._common import (
     save_model_from_runner,
 )
 
-
 _CHUNK_PIPELINE_VERSION = 2
 _HASH_BLOCK_BYTES = 8 * 1024 * 1024
 _WRITER_OWNER_FILENAME = ".frgs_chunk_owner.json"
@@ -803,6 +802,17 @@ class Reconstruct(BaseCommand):
             incompatibilities.append("tx.normalization_type must be 'none'")
         if self.tx.points_percentile_filter != 0.0:
             incompatibilities.append("tx.points_percentile_filter must be 0")
+        if self.tx.min_points_per_image >= 0:
+            incompatibilities.append(
+                "tx.min_points_per_image must be negative because the partial loader intentionally omits "
+                "per-image point observations"
+            )
+        if self.cfg.sparse_depth_reg > 0.0:
+            incompatibilities.append("cfg.sparse_depth_reg must be 0 because the partial loader omits point tracks")
+        if self.opt.spatial_scale_mode in (SpatialScaleMode.MEDIAN_CAMERA_DEPTH, SpatialScaleMode.MAX_CAMERA_DEPTH):
+            incompatibilities.append(
+                "opt.spatial_scale_mode must not require per-image point observations with the partial loader"
+            )
         return incompatibilities
 
     def _can_use_single_colmap_bbox_fast_path(self) -> tuple[bool, str]:
@@ -821,7 +831,7 @@ class Reconstruct(BaseCommand):
         crop_bbox = np.asarray(self.tx.crop_bbox, dtype=np.float32)
         source = TracklessColmapSceneSource(self.dataset_path)
         self.logger.info(
-            "COLMAP bbox fast path: scanning %s trackless initialization points inside %s and validating point order",
+            "COLMAP bbox fast path: scanning %s bounded-load initialization points inside %s and validating point order",
             f"{source.point_count:,}",
             crop_bbox,
         )
@@ -863,8 +873,11 @@ class Reconstruct(BaseCommand):
             incompatibilities.append("tx.crop_to_points must be disabled")
         if self.tx.min_points_per_image >= 0:
             incompatibilities.append(
-                "tx.min_points_per_image must be negative because trackless points have no per-image observations"
+                "tx.min_points_per_image must be negative because the partial loader intentionally omits "
+                "per-image point observations"
             )
+        if self.cfg.sparse_depth_reg > 0.0:
+            incompatibilities.append("cfg.sparse_depth_reg must be 0 because the partial loader omits point tracks")
         if self.opt.spatial_scale_mode != SpatialScaleMode.ABSOLUTE_UNITS:
             incompatibilities.append("opt.spatial_scale_mode must be ABSOLUTE_UNITS")
         return incompatibilities
@@ -879,7 +892,7 @@ class Reconstruct(BaseCommand):
         return supported, reason
 
     def _run_partial_colmap_reconstruction(self, viz_scene: fviz.Scene | None) -> None:
-        """Train chunked trackless binary COLMAP without ever materializing the global point model."""
+        """Train chunked binary COLMAP without ever materializing the global point model."""
 
         source = TracklessColmapSceneSource(self.dataset_path)
         if self.tx.crop_bbox is not None:
@@ -928,7 +941,7 @@ class Reconstruct(BaseCommand):
             )
 
         source_signature: dict[str, object] = {
-            "loader": "trackless_binary_colmap_partial",
+            "loader": "mixed_track_binary_colmap_partial_v2",
             "point_source_fingerprint": source.fingerprint,
             "point_source_full_sha256": source.full_fingerprint,
             "point_count": source.point_count,

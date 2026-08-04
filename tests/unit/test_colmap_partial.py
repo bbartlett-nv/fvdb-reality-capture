@@ -3,6 +3,7 @@
 #
 
 import hashlib
+import os
 import pathlib
 import struct
 import tempfile
@@ -32,14 +33,24 @@ def _write_camera_model(sparse_path: pathlib.Path) -> None:
         file.write(struct.pack("<Q", 0))
 
 
-def _write_points(sparse_path: pathlib.Path, points, track: tuple[int, int] | None = None) -> None:
+def _write_points(
+    sparse_path: pathlib.Path,
+    points,
+    track: tuple[int, int] | None = None,
+    tracks: list[tuple[tuple[int, int], ...]] | None = None,
+) -> None:
+    if track is not None and tracks is not None:
+        raise ValueError("track and tracks are mutually exclusive")
+    if tracks is not None and len(tracks) != len(points):
+        raise ValueError("tracks must contain one entry per point")
+
     with (sparse_path / "points3D.bin").open("wb") as file:
         file.write(struct.pack("<Q", len(points)))
-        for point_id, xyz, rgb, error in points:
-            track_length = 0 if track is None else 1
-            file.write(struct.pack("<Q3d3BdQ", point_id, *xyz, *rgb, error, track_length))
-            if track is not None:
-                file.write(struct.pack("<II", *track))
+        for point_index, (point_id, xyz, rgb, error) in enumerate(points):
+            point_track = tracks[point_index] if tracks is not None else (() if track is None else (track,))
+            file.write(struct.pack("<Q3d3BdQ", point_id, *xyz, *rgb, error, len(point_track)))
+            for image_id, point2d_index in point_track:
+                file.write(struct.pack("<II", image_id, point2d_index))
 
 
 class ColmapPartialTests(unittest.TestCase):
@@ -62,20 +73,113 @@ class ColmapPartialTests(unittest.TestCase):
     def tearDown(self):
         self.temporary_directory.cleanup()
 
-    def test_probe_rejects_points_with_visibility_tracks(self):
+    def test_probe_and_source_support_points_with_visibility_tracks(self):
+        _write_points(self.sparse_path, self.points[:1], track=(7, 0))
+
         supported, reason = probe_trackless_colmap_binary(self.root)
         self.assertTrue(supported, reason)
+        self.assertIn("1 tracked points with 1 observations", reason)
 
-        _write_points(self.sparse_path, self.points[:1], track=(7, 0))
+        source = ColmapBinaryPointSource(self.root, block_size=2)
+        self.assertEqual(source.point_count, 1)
+        self.assertEqual(source.variable_prefix_count, 1)
+        self.assertEqual(source.tracked_point_count, 1)
+        self.assertEqual(source.track_observation_count, 1)
+        self.assertEqual(source.trackless_suffix_count, 0)
+        selection = source.query_points()
+        np.testing.assert_array_equal(selection.point_ids, [9])
+        np.testing.assert_allclose(selection.points, [[-1.0, 0.0, 0.0]])
+
+    def test_arbitrarily_interleaved_tracks_stream_before_validated_fixed_suffix(self):
+        tracks = (
+            ((7, 0),),
+            (),
+            ((7, 2), (8, 4)),
+            (),
+        )
+        _write_points(self.sparse_path, self.points, tracks=tracks)
+
+        supported, reason = probe_trackless_colmap_binary(self.root)
+        self.assertTrue(supported, reason)
+        self.assertIn("2 tracked points with 3 observations", reason)
+        self.assertIn("in 3 streamed records", reason)
+        self.assertIn("1 trackless fixed-size records", reason)
+
+        source = ColmapBinaryPointSource(self.root, block_size=2)
+        self.assertEqual(source.point_count, 4)
+        self.assertEqual(source.variable_prefix_count, 3)
+        self.assertEqual(source.tracked_point_count, 2)
+        self.assertEqual(source.track_observation_count, 3)
+        self.assertEqual(source.trackless_suffix_count, 1)
+        np.testing.assert_allclose(source.bounds(), [-1.0, 0.0, 0.0, 2.0, 1.0, 1.0])
+
+        bbox = np.array([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0])
+        self.assertEqual(source.count_points(bbox, bounds_mode="closed"), 3)
+        selection = source.query_points(bbox, bounds_mode="closed", expected_selected_count=3)
+        np.testing.assert_array_equal(selection.point_ids, [9, 2, 5])
+        np.testing.assert_allclose(selection.points, [[-1, 0, 0], [0, 0, 0], [1, 1, 1]])
+        np.testing.assert_array_equal(selection.points_rgb, [[10, 20, 30], [40, 50, 60], [70, 80, 90]])
+        np.testing.assert_allclose(selection.points_err, [0.1, 0.2, 0.3])
+
+    def test_rejects_nonzero_track_length_without_payload_in_fixed_size_file(self):
+        point_id, xyz, rgb, error = self.points[0]
+        with (self.sparse_path / "points3D.bin").open("wb") as point_file:
+            point_file.write(struct.pack("<Q", 1))
+            point_file.write(struct.pack("<Q3d3BdQ", point_id, *xyz, *rgb, error, 1))
+
         supported, reason = probe_trackless_colmap_binary(self.root)
         self.assertFalse(supported)
-        self.assertIn("empty visibility track", reason)
-        with self.assertRaisesRegex(UnsupportedColmapPartialLoadError, "empty visibility track"):
+        self.assertIn("only enough bytes for fixed-size records", reason)
+        with self.assertRaisesRegex(UnsupportedColmapPartialLoadError, "only enough bytes"):
             ColmapBinaryPointSource(self.root)
+
+    def test_rejects_track_length_that_consumes_required_later_records(self):
+        first_id, first_xyz, first_rgb, first_error = self.points[0]
+        second_id, second_xyz, second_rgb, second_error = self.points[1]
+        with (self.sparse_path / "points3D.bin").open("wb") as point_file:
+            point_file.write(struct.pack("<Q", 2))
+            point_file.write(struct.pack("<Q3d3BdQ", first_id, *first_xyz, *first_rgb, first_error, 2))
+            point_file.write(struct.pack("<II", 7, 0))
+            point_file.write(struct.pack("<Q3d3BdQ", second_id, *second_xyz, *second_rgb, second_error, 0))
+
+        supported, reason = probe_trackless_colmap_binary(self.root)
+        self.assertFalse(supported)
+        self.assertIn("while reserving the remaining point records", reason)
+
+    def test_rejects_truncation_overflow_and_non_track_trailing_bytes(self):
+        points_path = self.sparse_path / "points3D.bin"
+        points_path.write_bytes(struct.pack("<Q", (1 << 64) - 1))
+        supported, reason = probe_trackless_colmap_binary(self.root)
+        self.assertFalse(supported)
+        self.assertIn("requiring at least", reason)
+
+        _write_points(self.sparse_path, self.points)
+        with points_path.open("ab") as point_file:
+            point_file.write(b"bad")
+        supported, reason = probe_trackless_colmap_binary(self.root)
+        self.assertFalse(supported)
+        self.assertIn("multiple of 8 bytes", reason)
+
+    def test_rejects_same_size_same_mtime_path_replacement_after_open(self):
+        points_path = self.sparse_path / "points3D.bin"
+        source = ColmapBinaryPointSource(self.root, block_size=2)
+        original_stat = points_path.stat()
+
+        replacement_path = self.sparse_path / "replacement.bin"
+        replacement_path.write_bytes(points_path.read_bytes())
+        os.utime(replacement_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        os.replace(replacement_path, points_path)
+
+        with self.assertRaisesRegex(RuntimeError, "changed after it was opened"):
+            source.count_points()
 
     def test_bounded_queries_preserve_columns_and_boundary_modes(self):
         source = ColmapBinaryPointSource(self.root, block_size=2)
         self.assertEqual(source.point_count, 4)
+        self.assertEqual(source.variable_prefix_count, 0)
+        self.assertEqual(source.tracked_point_count, 0)
+        self.assertEqual(source.track_observation_count, 0)
+        self.assertEqual(source.trackless_suffix_count, 4)
         self.assertEqual(len(source.fingerprint), 64)
         np.testing.assert_allclose(source.bounds(), [-1.0, 0.0, 0.0, 2.0, 1.0, 1.0])
 
