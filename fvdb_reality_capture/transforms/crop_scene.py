@@ -64,11 +64,7 @@ def _points_in_bbox_mask(
         raise ValueError(f"points must have shape (N, 3), got {points.shape}")
     if bbox.shape != (6,):
         raise ValueError(f"bbox must have shape (6,), got {bbox.shape}")
-    if (
-        isinstance(block_size, bool)
-        or not isinstance(block_size, (int, np.integer))
-        or block_size <= 0
-    ):
+    if isinstance(block_size, bool) or not isinstance(block_size, (int, np.integer)) or block_size <= 0:
         raise ValueError(f"block_size must be a positive integer, got {block_size!r}")
 
     num_points = len(points)
